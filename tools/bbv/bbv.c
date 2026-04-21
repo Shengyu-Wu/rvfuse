@@ -224,6 +224,16 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (g_strcmp0(tokens[0], "outfile") == 0) {
             filename = tokens[1];
             tokens[1] = NULL;
+        } else if (g_strcmp0(tokens[0], "func_name") == 0) {
+            target_func_name = g_strdup(tokens[1]);
+            filter_enabled = true;
+            state = STATE_DETECTING;
+            detect_insn_count = 0;
+            symbol_match_count = 0;
+            disas_header_written = false;
+            tokens[1] = NULL;  /* Prevent double-free */
+        } else if (g_strcmp0(tokens[0], "func_size") == 0) {
+            target_func_size = g_ascii_strtoull(tokens[1], NULL, 0);
         } else {
             fprintf(stderr, "option parsing failed: %s\n", opt);
             return -1;
