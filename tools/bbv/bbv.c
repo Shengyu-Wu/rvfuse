@@ -172,6 +172,106 @@ static void vcpu_interval_exec(unsigned int vcpu_index, void *udata)
     fputc('\n', vcpu->file);
 }
 
+/* ========== RISC-V Prologue Detection ========== */
+
+/*
+ * Check if instruction is stack allocation (addi sp, sp, -imm)
+ * Returns true for negative immediate stack growth.
+ */
+static bool is_stack_alloc_insn(uint32_t insn_raw, size_t insn_size)
+{
+    if (insn_size == 2) {
+        /* Compressed: C.ADDI16SP (c.addi16sp sp, nzimm) */
+        uint16_t insn = (uint16_t)insn_raw;
+        return (insn & 0xE383) == 0x6103;  /* C.ADDI16SP opcode pattern */
+    } else if (insn_size == 4) {
+        /* 32-bit: ADDI rd=sp(2), rs1=sp(2), imm<0 */
+        uint32_t opcode = insn_raw & 0x7F;
+        uint32_t rd = (insn_raw >> 7) & 0x1F;
+        uint32_t rs1 = (insn_raw >> 15) & 0x1F;
+        uint32_t funct3 = (insn_raw >> 12) & 0x7;
+
+        /* Sign-extend 12-bit immediate */
+        int32_t imm = (int32_t)((insn_raw >> 20) & 0xFFF);
+        if (imm & 0x800) imm |= 0xFFFFF000;
+
+        return opcode == 0x13 &&       /* OP-IMM */
+               funct3 == 0x0 &&        /* ADDI */
+               rd == 2 &&              /* sp (x2) */
+               rs1 == 2 &&             /* sp (x2) */
+               imm < 0;                /* negative = stack growth */
+    }
+    return false;
+}
+
+/*
+ * Check if instruction saves callee-saved register to stack.
+ * Pattern: sd rs, offset(sp) or c.sd rs, offset(sp)
+ */
+static bool is_callee_save_insn(uint32_t insn_raw, size_t insn_size)
+{
+    if (insn_size == 2) {
+        /* Compressed: C.SD (c.sd rs2', offset(sp)) */
+        uint16_t insn = (uint16_t)insn_raw;
+        uint16_t opcode = insn & 0x3;
+        uint16_t funct3 = (insn >> 13) & 0x7;
+        uint16_t rs1 = (insn >> 7) & 0x7;
+
+        return opcode == 0x0 &&        /* C0 quadrant */
+               funct3 == 0x7 &&        /* C.SD */
+               rs1 == 0x2;             /* sp base */
+    } else if (insn_size == 4) {
+        /* 32-bit: SD rs2, imm(rs1) */
+        uint32_t opcode = insn_raw & 0x7F;
+        uint32_t funct3 = (insn_raw >> 12) & 0x7;
+        uint32_t rs1 = (insn_raw >> 15) & 0x1F;
+
+        return opcode == 0x23 &&       /* STORE */
+               funct3 == 0x3 &&        /* SD (64-bit) */
+               rs1 == 2;               /* sp base */
+    }
+    return false;
+}
+
+/*
+ * Detect RISC-V function prologue pattern.
+ * Typical: addi sp, sp, -N followed by sd ra/s0, offset(sp)
+ * Returns true if TB appears to be at function entry.
+ */
+__attribute__((unused))
+static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
+{
+    size_t n_insns = qemu_plugin_tb_n_insns(tb);
+    if (n_insns < 2) return false;
+
+    /* Check first instruction for stack allocation */
+    struct qemu_plugin_insn *insn0 = qemu_plugin_tb_get_insn(tb, 0);
+    size_t size0 = qemu_plugin_insn_size(insn0);
+    uint8_t data0[4] = {0};
+    qemu_plugin_insn_data(insn0, data0, size0);
+    uint32_t raw0 = (size0 == 2) ? *(uint16_t *)data0 : *(uint32_t *)data0;
+
+    if (!is_stack_alloc_insn(raw0, size0)) {
+        /* Some leaf functions skip stack allocation, check for sd anyway */
+        struct qemu_plugin_insn *insn1 = qemu_plugin_tb_get_insn(tb, 1);
+        size_t size1 = qemu_plugin_insn_size(insn1);
+        uint8_t data1[4] = {0};
+        qemu_plugin_insn_data(insn1, data1, size1);
+        uint32_t raw1 = (size1 == 2) ? *(uint16_t *)data1 : *(uint32_t *)data1;
+
+        return is_callee_save_insn(raw1, size1);
+    }
+
+    /* Stack allocation found, check second for callee-save */
+    struct qemu_plugin_insn *insn1 = qemu_plugin_tb_get_insn(tb, 1);
+    size_t size1 = qemu_plugin_insn_size(insn1);
+    uint8_t data1[4] = {0};
+    qemu_plugin_insn_data(insn1, data1, size1);
+    uint32_t raw1 = (size1 == 2) ? *(uint16_t *)data1 : *(uint32_t *)data1;
+
+    return is_callee_save_insn(raw1, size1) || n_insns > 2;
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t n_insns = qemu_plugin_tb_n_insns(tb);
