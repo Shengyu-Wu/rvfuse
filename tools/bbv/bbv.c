@@ -273,12 +273,79 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
     return is_callee_save_insn(raw1, size1) || n_insns > 2;
 }
 
+/*
+ * Detect target function symbol in TB.
+ * Checks each instruction's symbol name against target_func_name.
+ * On match with valid prologue, computes address range and switches to RECORDING.
+ */
+static void detect_target_symbol(struct qemu_plugin_tb *tb)
+{
+    size_t n_insns = qemu_plugin_tb_n_insns(tb);
+    uint64_t tb_vaddr = qemu_plugin_tb_vaddr(tb);
+
+    detect_insn_count += n_insns;
+
+    /* Timeout check: after MAX_DETECT_INSNS, use first symbol match */
+    if (detect_insn_count > MAX_DETECT_INSNS && state == STATE_DETECTING) {
+        qemu_plugin_outs("BBV: Detection timeout - checking final symbols\n");
+    }
+
+    for (size_t i = 0; i < n_insns; i++) {
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        const char *sym = qemu_plugin_insn_symbol(insn);
+
+        if (sym && target_func_name && g_strcmp0(sym, target_func_name) == 0) {
+            symbol_match_count++;
+
+            bool is_entry = is_riscv_function_entry(tb);
+
+            if (is_entry || detect_insn_count > MAX_DETECT_INSNS) {
+                /* Found function entry (or timeout fallback) */
+                func_start_vaddr = tb_vaddr;
+                func_end_vaddr = func_start_vaddr + target_func_size;
+                state = STATE_RECORDING;
+
+                /* Log detection info */
+                g_autofree gchar *msg = g_strdup_printf(
+                    "BBV: Target function '%s' detected at 0x%" PRIx64
+                    " (size 0x%" PRIx64 ", end 0x%" PRIx64 ")%s\n",
+                    target_func_name, func_start_vaddr, target_func_size, func_end_vaddr,
+                    is_entry ? "" : " [timeout fallback]");
+                qemu_plugin_outs(msg);
+                return;
+            } else {
+                g_autofree gchar *msg = g_strdup_printf(
+                    "BBV: Symbol '%s' matched at 0x%" PRIx64 " but not prologue (match #%d)\n",
+                    target_func_name, tb_vaddr, symbol_match_count);
+                qemu_plugin_outs(msg);
+            }
+        }
+    }
+}
+
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     uint64_t n_insns = qemu_plugin_tb_n_insns(tb);
     uint64_t vaddr = qemu_plugin_tb_vaddr(tb);
     Bb *bb;
 
+    /* ========== Filter Mode: State Machine ========== */
+    if (filter_enabled) {
+        switch (state) {
+        case STATE_DETECTING:
+            detect_target_symbol(tb);
+            return;  /* No instrumentation during detection */
+
+        case STATE_RECORDING:
+            /* Only instrument if within target function range */
+            if (vaddr < func_start_vaddr || vaddr >= func_end_vaddr) {
+                return;  /* Skip BBs outside target function */
+            }
+            break;  /* Proceed to instrument this BB */
+        }
+    }
+
+    /* ========== Normal Instrumentation ========== */
     g_rw_lock_writer_lock(&bbs_lock);
     bb = g_hash_table_lookup(bbs, &vaddr);
     if (!bb) {
@@ -295,13 +362,30 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
                 uint64_t insn_vaddr = qemu_plugin_insn_vaddr(insn);
                 char *disas = qemu_plugin_insn_disas(insn);
-                fprintf(disas_file, "  0x%" PRIx64 ": %s\n", insn_vaddr, disas ? disas : "unknown");
+                const char *sym = qemu_plugin_insn_symbol(insn);
+                fprintf(disas_file, "  0x%" PRIx64 ": %s",
+                        insn_vaddr, disas ? disas : "unknown");
+                if (sym) {
+                    fprintf(disas_file, " [%s]", sym);
+                }
+                fprintf(disas_file, "\n");
                 g_free(disas);
             }
             fprintf(disas_file, "\n");
         }
     }
     g_rw_lock_writer_unlock(&bbs_lock);
+
+    /* Write header for first BB in filtered mode */
+    if (filter_enabled && state == STATE_RECORDING && !disas_header_written && disas_file) {
+        fprintf(disas_file, "# BBV Function-Scoped Mode\n");
+        fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
+                target_func_name, target_func_size);
+        fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                func_start_vaddr, func_end_vaddr);
+        fprintf(disas_file, "#\n\n");
+        disas_header_written = true;
+    }
 
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_ADD_U64, count_u64(), n_insns);
