@@ -183,7 +183,11 @@ static bool is_stack_alloc_insn(uint32_t insn_raw, size_t insn_size)
     if (insn_size == 2) {
         /* Compressed: C.ADDI16SP (c.addi16sp sp, nzimm) */
         uint16_t insn = (uint16_t)insn_raw;
-        return (insn & 0xE383) == 0x6103;  /* C.ADDI16SP opcode pattern */
+        uint16_t funct3 = (insn >> 13) & 0x7;
+        uint16_t rd = (insn >> 7) & 0x1F;
+        uint16_t quadrant = insn & 0x3;
+        /* C.ADDI16SP: funct3=3, rd=sp(2), quadrant=1 */
+        return funct3 == 3 && rd == 2 && quadrant == 1;
     } else if (insn_size == 4) {
         /* 32-bit: ADDI rd=sp(2), rs1=sp(2), imm<0 */
         uint32_t opcode = insn_raw & 0x7F;
@@ -211,15 +215,12 @@ static bool is_stack_alloc_insn(uint32_t insn_raw, size_t insn_size)
 static bool is_callee_save_insn(uint32_t insn_raw, size_t insn_size)
 {
     if (insn_size == 2) {
-        /* Compressed: C.SD (c.sd rs2', offset(sp)) */
+        /* Compressed: C.SDSP (c.sdsp rs2, offset(sp)) */
         uint16_t insn = (uint16_t)insn_raw;
-        uint16_t opcode = insn & 0x3;
+        uint16_t quadrant = insn & 0x3;
         uint16_t funct3 = (insn >> 13) & 0x7;
-        uint16_t rs1 = (insn >> 7) & 0x7;
-
-        return opcode == 0x0 &&        /* C0 quadrant */
-               funct3 == 0x7 &&        /* C.SD */
-               rs1 == 0x2;             /* sp base */
+        /* C.SDSP: quadrant=2 (C2), funct3=7, sp is implicit (no rs1 field) */
+        return quadrant == 2 && funct3 == 7;
     } else if (insn_size == 4) {
         /* 32-bit: SD rs2, imm(rs1) */
         uint32_t opcode = insn_raw & 0x7F;
