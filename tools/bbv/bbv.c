@@ -305,6 +305,16 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
                 func_end_vaddr = func_start_vaddr + target_func_size;
                 state = STATE_RECORDING;
 
+                /* Write header to disas file immediately */
+                if (disas_file) {
+                    fprintf(disas_file, "# BBV Function-Scoped Mode\n");
+                    fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
+                            target_func_name, target_func_size);
+                    fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                            func_start_vaddr, func_end_vaddr);
+                    fprintf(disas_file, "#\n\n");
+                }
+
                 /* Log detection info */
                 g_autofree gchar *msg = g_strdup_printf(
                     "BBV: Target function '%s' detected at 0x%" PRIx64
@@ -362,30 +372,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
                 uint64_t insn_vaddr = qemu_plugin_insn_vaddr(insn);
                 char *disas = qemu_plugin_insn_disas(insn);
-                const char *sym = qemu_plugin_insn_symbol(insn);
-                fprintf(disas_file, "  0x%" PRIx64 ": %s",
+                fprintf(disas_file, "  0x%" PRIx64 ": %s\n",
                         insn_vaddr, disas ? disas : "unknown");
-                if (sym) {
-                    fprintf(disas_file, " [%s]", sym);
-                }
-                fprintf(disas_file, "\n");
                 g_free(disas);
             }
             fprintf(disas_file, "\n");
         }
     }
     g_rw_lock_writer_unlock(&bbs_lock);
-
-    /* Write header for first BB in filtered mode */
-    if (filter_enabled && state == STATE_RECORDING && !disas_header_written && disas_file) {
-        fprintf(disas_file, "# BBV Function-Scoped Mode\n");
-        fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
-                target_func_name, target_func_size);
-        fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
-                func_start_vaddr, func_end_vaddr);
-        fprintf(disas_file, "#\n\n");
-        disas_header_written = true;
-    }
 
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_ADD_U64, count_u64(), n_insns);
