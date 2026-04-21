@@ -31,6 +31,33 @@ static FILE *disas_file;
 static struct qemu_plugin_scoreboard *vcpus;
 static uint64_t interval = 100000000;
 
+/* ========== Function-Scoped Recording ========== */
+
+/* State machine for filtered recording */
+enum plugin_state {
+    STATE_DETECTING,    /* Waiting for target symbol */
+    STATE_RECORDING    /* Recording only target function BBs */
+};
+
+/* Configuration (user-provided via plugin args) */
+static char *target_func_name __attribute__((unused));      /* e.g. "ggml_gemv_q4_0_16x1_q8_0" */
+static uint64_t target_func_size __attribute__((unused));   /* e.g. 0x30a (778 bytes) */
+
+/* Detected/calculated at runtime */
+static uint64_t func_start_vaddr __attribute__((unused));   /* Detected function entry address */
+static uint64_t func_end_vaddr __attribute__((unused));     /* func_start_vaddr + target_func_size */
+
+/* State tracking */
+static enum plugin_state state __attribute__((unused));
+static bool filter_enabled __attribute__((unused));         /* true when func_name specified */
+static uint64_t detect_insn_count __attribute__((unused));  /* Timeout counter for detection */
+static int symbol_match_count __attribute__((unused));      /* Number of symbol matches found */
+
+#define MAX_DETECT_INSNS 100000     /* Timeout threshold */
+
+/* Header tracking for disas output */
+static bool disas_header_written __attribute__((unused));   /* Track if header written to disas */
+
 static void free_bb(void *data)
 {
     qemu_plugin_scoreboard_free(((Bb *)data)->count);
