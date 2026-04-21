@@ -120,6 +120,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     g_hash_table_unref(bbs);
     g_free(filename);
+    g_free(target_func_name);
     if (disas_file) {
         fclose(disas_file);
     }
@@ -242,6 +243,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     if (!filename) {
         fputs("outfile unspecified\n", stderr);
+        return -1;
+    }
+
+    if (filter_enabled && !target_func_name) {
+        fputs("func_name value required\n", stderr);
         return -1;
     }
 
