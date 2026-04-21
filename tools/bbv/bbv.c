@@ -109,6 +109,23 @@ static void plugin_flush(void)
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
+    /* Warn if target function was never detected */
+    if (filter_enabled && state == STATE_DETECTING) {
+        g_autofree gchar *msg = g_strdup_printf(
+            "BBV WARNING: Target function '%s' never executed. No BBV data recorded.\n",
+            target_func_name ? target_func_name : "(unknown)");
+        qemu_plugin_outs(msg);
+
+        if (disas_file) {
+            fprintf(disas_file, "# BBV Function-Scoped Mode - TARGET NOT FOUND\n");
+            fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
+                    target_func_name ? target_func_name : "(unknown)",
+                    target_func_size);
+            fprintf(disas_file, "# Symbol matches: %d\n", symbol_match_count);
+            fprintf(disas_file, "# Instructions checked: %" PRIu64 "\n", detect_insn_count);
+        }
+    }
+
     plugin_flush();
 
     for (int i = 0; i < qemu_plugin_num_vcpus(); i++) {
