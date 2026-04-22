@@ -8,6 +8,8 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <glib.h>
 
 #include <qemu-plugin.h>
@@ -41,7 +43,10 @@ enum plugin_state {
 
 /* Configuration (user-provided via plugin args) */
 static char *target_func_name __attribute__((unused));      /* e.g. "ggml_gemv_q4_0_16x1_q8_0" */
+static char *lib_name;                                       /* Shared library name, e.g. "libggml-cpu" */
+static uint64_t func_offset;                                 /* Static offset from nm, e.g. 0xacab2 */
 static uint64_t target_func_size __attribute__((unused));   /* e.g. 0x30a (778 bytes) */
+static uint64_t func_addr __attribute__((unused));           /* Direct runtime address (alternative to lib_name+offset) */
 
 /* Detected/calculated at runtime */
 static uint64_t func_start_vaddr __attribute__((unused));   /* Detected function entry address */
@@ -62,6 +67,48 @@ static void free_bb(void *data)
 {
     qemu_plugin_scoreboard_free(((Bb *)data)->count);
     g_free(data);
+}
+
+/*
+ * Parse /proc/self/maps to find the base address of a shared library.
+ * In QEMU user-mode, guest memory is mapped in the host process,
+ * so we can parse host's /proc/self/maps to find library mappings.
+ * Returns 0 if library not found.
+ */
+static uint64_t find_library_base(const char *lib_pattern)
+{
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        qemu_plugin_outs("BBV: Failed to open /proc/self/maps\n");
+        return 0;
+    }
+
+    char line[512];
+    uint64_t base = 0;
+
+    while (fgets(line, sizeof(line), maps)) {
+        /* Look for the library in the mappings */
+        if (strstr(line, lib_pattern)) {
+            /* Parse the start address from the line */
+            /* Format: "7f1234560000-7f1234570000 r-xp ... libname" */
+            uint64_t start, end;
+            char perms[5];
+            if (sscanf(line, "%" PRIx64 "-%" PRIx64 " %4s", &start, &end, perms) == 3) {
+                /* Only consider executable mappings (r-xp) */
+                if (perms[1] == 'x') {
+                    base = start;
+                    g_autofree gchar *msg = g_strdup_printf(
+                        "BBV: Library '%s' found at 0x%" PRIx64 " (size 0x%" PRIx64 ")\n",
+                        lib_pattern, base, end - start);
+                    qemu_plugin_outs(msg);
+                    break;
+                }
+            }
+        }
+    }
+
+    fclose(maps);
+    return base;
 }
 
 static qemu_plugin_u64 count_u64(void)
@@ -111,16 +158,21 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     /* Warn if target function was never detected */
     if (filter_enabled && state == STATE_DETECTING) {
+        const char *target_name = target_func_name ? target_func_name :
+                                  (lib_name ? lib_name : "(unknown)");
         g_autofree gchar *msg = g_strdup_printf(
             "BBV WARNING: Target function '%s' never executed. No BBV data recorded.\n",
-            target_func_name ? target_func_name : "(unknown)");
+            target_name);
         qemu_plugin_outs(msg);
 
         if (disas_file) {
             fprintf(disas_file, "# BBV Function-Scoped Mode - TARGET NOT FOUND\n");
             fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
-                    target_func_name ? target_func_name : "(unknown)",
-                    target_func_size);
+                    target_name, target_func_size);
+            if (lib_name) {
+                fprintf(disas_file, "# Library: %s, Offset: 0x%" PRIx64 "\n",
+                        lib_name, func_offset);
+            }
             fprintf(disas_file, "# Symbol matches: %d\n", symbol_match_count);
             fprintf(disas_file, "# Instructions checked: %" PRIu64 "\n", detect_insn_count);
         }
@@ -138,6 +190,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_hash_table_unref(bbs);
     g_free(filename);
     g_free(target_func_name);
+    g_free(lib_name);
     if (disas_file) {
         fclose(disas_file);
     }
@@ -291,9 +344,10 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
 }
 
 /*
- * Detect target function symbol in TB.
- * Checks each instruction's symbol name against target_func_name.
- * On match with valid prologue, computes address range and switches to RECORDING.
+ * Detect target function by:
+ * 1. Symbol name matching (for statically linked or main program symbols)
+ * 2. Address range detection via library base + offset (for shared libraries)
+ * On match, computes address range and switches to RECORDING.
  */
 static void detect_target_symbol(struct qemu_plugin_tb *tb)
 {
@@ -307,44 +361,118 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
         qemu_plugin_outs("BBV: Detection timeout - checking final symbols\n");
     }
 
-    for (size_t i = 0; i < n_insns; i++) {
-        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        const char *sym = qemu_plugin_insn_symbol(insn);
+    /* Method 1: Symbol name matching (for main program symbols) */
+    if (target_func_name) {
+        for (size_t i = 0; i < n_insns; i++) {
+            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+            const char *sym = qemu_plugin_insn_symbol(insn);
 
-        if (sym && target_func_name && g_strcmp0(sym, target_func_name) == 0) {
-            symbol_match_count++;
+            if (sym && g_strcmp0(sym, target_func_name) == 0) {
+                symbol_match_count++;
 
-            bool is_entry = is_riscv_function_entry(tb);
+                bool is_entry = is_riscv_function_entry(tb);
 
-            if (is_entry || detect_insn_count > MAX_DETECT_INSNS) {
-                /* Found function entry (or timeout fallback) */
-                func_start_vaddr = tb_vaddr;
+                if (is_entry || detect_insn_count > MAX_DETECT_INSNS) {
+                    /* Found function entry (or timeout fallback) */
+                    func_start_vaddr = tb_vaddr;
+                    func_end_vaddr = func_start_vaddr + target_func_size;
+                    state = STATE_RECORDING;
+
+                    /* Write header to disas file immediately */
+                    if (disas_file) {
+                        fprintf(disas_file, "# BBV Function-Scoped Mode\n");
+                        fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
+                                target_func_name, target_func_size);
+                        fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                                func_start_vaddr, func_end_vaddr);
+                        fprintf(disas_file, "#\n\n");
+                    }
+
+                    /* Log detection info */
+                    g_autofree gchar *msg = g_strdup_printf(
+                        "BBV: Target function '%s' detected at 0x%" PRIx64
+                        " (size 0x%" PRIx64 ", end 0x%" PRIx64 ")%s\n",
+                        target_func_name, func_start_vaddr, target_func_size, func_end_vaddr,
+                        is_entry ? "" : " [timeout fallback]");
+                    qemu_plugin_outs(msg);
+                    return;
+                } else {
+                    g_autofree gchar *msg = g_strdup_printf(
+                        "BBV: Symbol '%s' matched at 0x%" PRIx64 " but not prologue (match #%d)\n",
+                        target_func_name, tb_vaddr, symbol_match_count);
+                    qemu_plugin_outs(msg);
+                }
+            }
+        }
+    }
+
+    /* Method 2: Direct address mode (func_addr + func_size specified) */
+    if (func_addr > 0 && target_func_size > 0 && state == STATE_DETECTING) {
+        /* User provided exact runtime address - use directly */
+        func_start_vaddr = func_addr;
+        func_end_vaddr = func_addr + target_func_size;
+        state = STATE_RECORDING;
+
+        if (disas_file) {
+            fprintf(disas_file, "# BBV Function-Scoped Mode (Direct Address)\n");
+            fprintf(disas_file, "# Function address: 0x%" PRIx64 "\n", func_addr);
+            fprintf(disas_file, "# Function size: 0x%" PRIx64 "\n", target_func_size);
+            fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                    func_start_vaddr, func_end_vaddr);
+            fprintf(disas_file, "#\n\n");
+        }
+
+        g_autofree gchar *msg = g_strdup_printf(
+            "BBV: Direct address mode - recording [0x%" PRIx64 ", 0x%" PRIx64 ")\n",
+            func_start_vaddr, func_end_vaddr);
+        qemu_plugin_outs(msg);
+        return;
+    }
+
+    /* Method 3: Address-based detection for shared libraries */
+    if (lib_name && func_offset > 0 && state == STATE_DETECTING) {
+        /* Check if this TB is near our expected function address */
+        /* The library base is detected once, then we check if TB falls in range */
+        static uint64_t lib_base = 0;
+        static bool lib_searched = false;
+
+        if (!lib_searched) {
+            lib_base = find_library_base(lib_name);
+            lib_searched = true;
+
+            if (lib_base > 0) {
+                func_start_vaddr = lib_base + func_offset;
                 func_end_vaddr = func_start_vaddr + target_func_size;
+
+                g_autofree gchar *msg = g_strdup_printf(
+                    "BBV: Calculated function address: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                    func_start_vaddr, func_end_vaddr);
+                qemu_plugin_outs(msg);
+            }
+        }
+
+        /* If we have a calculated address, check if this TB falls in range */
+        if (lib_base > 0 && func_start_vaddr > 0) {
+            /* Check if TB address matches our expected function start */
+            if (tb_vaddr == func_start_vaddr) {
                 state = STATE_RECORDING;
 
-                /* Write header to disas file immediately */
                 if (disas_file) {
-                    fprintf(disas_file, "# BBV Function-Scoped Mode\n");
-                    fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
-                            target_func_name, target_func_size);
+                    fprintf(disas_file, "# BBV Function-Scoped Mode (Address-Based)\n");
+                    fprintf(disas_file, "# Library: %s (base 0x%" PRIx64 ")\n",
+                            lib_name, lib_base);
+                    fprintf(disas_file, "# Function: offset 0x%" PRIx64 ", size 0x%" PRIx64 "\n",
+                            func_offset, target_func_size);
                     fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
                             func_start_vaddr, func_end_vaddr);
                     fprintf(disas_file, "#\n\n");
                 }
 
-                /* Log detection info */
                 g_autofree gchar *msg = g_strdup_printf(
-                    "BBV: Target function '%s' detected at 0x%" PRIx64
-                    " (size 0x%" PRIx64 ", end 0x%" PRIx64 ")%s\n",
-                    target_func_name, func_start_vaddr, target_func_size, func_end_vaddr,
-                    is_entry ? "" : " [timeout fallback]");
+                    "BBV: Function detected at expected address 0x%" PRIx64 "\n",
+                    func_start_vaddr);
                 qemu_plugin_outs(msg);
                 return;
-            } else {
-                g_autofree gchar *msg = g_strdup_printf(
-                    "BBV: Symbol '%s' matched at 0x%" PRIx64 " but not prologue (match #%d)\n",
-                    target_func_name, tb_vaddr, symbol_match_count);
-                qemu_plugin_outs(msg);
             }
         }
     }
@@ -431,6 +559,19 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             tokens[1] = NULL;  /* Prevent double-free */
         } else if (g_strcmp0(tokens[0], "func_size") == 0) {
             target_func_size = g_ascii_strtoull(tokens[1], NULL, 0);
+        } else if (g_strcmp0(tokens[0], "lib_name") == 0) {
+            lib_name = g_strdup(tokens[1]);
+            filter_enabled = true;
+            state = STATE_DETECTING;
+            detect_insn_count = 0;
+            tokens[1] = NULL;
+        } else if (g_strcmp0(tokens[0], "func_offset") == 0) {
+            func_offset = g_ascii_strtoull(tokens[1], NULL, 0);
+        } else if (g_strcmp0(tokens[0], "func_addr") == 0) {
+            func_addr = g_ascii_strtoull(tokens[1], NULL, 0);
+            filter_enabled = true;
+            state = STATE_DETECTING;
+            detect_insn_count = 0;
         } else {
             fprintf(stderr, "option parsing failed: %s\n", opt);
             return -1;
@@ -442,8 +583,18 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
 
-    if (filter_enabled && !target_func_name) {
-        fputs("func_name value required\n", stderr);
+    if (filter_enabled && !target_func_name && !lib_name && func_addr == 0) {
+        fputs("func_name, lib_name, or func_addr required for filter mode\n", stderr);
+        return -1;
+    }
+
+    if (func_addr > 0 && target_func_size == 0) {
+        fputs("func_size required when func_addr is specified\n", stderr);
+        return -1;
+    }
+
+    if (lib_name && func_offset == 0) {
+        fputs("func_offset required when lib_name is specified\n", stderr);
         return -1;
     }
 
