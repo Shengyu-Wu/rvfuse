@@ -4,7 +4,8 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Extended: .disas file output and plugin_flush() at exit.
+ * Extended: .disas file output, plugin_flush() at exit,
+ * and function-scoped recording via symbol/addr/syscall detection.
  */
 
 #include <stdio.h>
@@ -35,33 +36,48 @@ static uint64_t interval = 100000000;
 
 /* ========== Function-Scoped Recording ========== */
 
-/* State machine for filtered recording */
 enum plugin_state {
-    STATE_DETECTING,    /* Waiting for target symbol */
-    STATE_RECORDING    /* Recording only target function BBs */
+    STATE_DETECTING,    /* Waiting for target symbol / library mmap */
+    STATE_RECORDING     /* Recording only target function BBs */
 };
 
 /* Configuration (user-provided via plugin args) */
-static char *target_func_name __attribute__((unused));      /* e.g. "ggml_gemv_q4_0_16x1_q8_0" */
-static char *lib_name;                                       /* Shared library name, e.g. "libggml-cpu" */
-static uint64_t func_offset;                                 /* Static offset from nm, e.g. 0xacab2 */
-static uint64_t target_func_size __attribute__((unused));   /* e.g. 0x30a (778 bytes) */
-static uint64_t func_addr __attribute__((unused));           /* Direct runtime address (alternative to lib_name+offset) */
+static char *target_func_name;      /* e.g. "ggml_gemv_q4_0_16x1_q8_0" */
+static char *lib_name;              /* Shared library name, e.g. "libggml-cpu" */
+static uint64_t func_offset;        /* Static offset from nm, e.g. 0xac9a4 */
+static uint64_t target_func_size;   /* e.g. 0x30a (778 bytes) */
+static uint64_t func_addr;          /* Direct runtime address */
 
 /* Detected/calculated at runtime */
-static uint64_t func_start_vaddr __attribute__((unused));   /* Detected function entry address */
-static uint64_t func_end_vaddr __attribute__((unused));     /* func_start_vaddr + target_func_size */
+static uint64_t func_start_vaddr;
+static uint64_t func_end_vaddr;
 
 /* State tracking */
-static enum plugin_state state __attribute__((unused));
-static bool filter_enabled __attribute__((unused));         /* true when func_name specified */
-static uint64_t detect_insn_count __attribute__((unused));  /* Timeout counter for detection */
-static int symbol_match_count __attribute__((unused));      /* Number of symbol matches found */
+static enum plugin_state state;
+static bool filter_enabled;
+static uint64_t detect_insn_count;
+static int symbol_match_count;
 
-#define MAX_DETECT_INSNS 100000     /* Timeout threshold */
+#define MAX_DETECT_INSNS 100000
 
 /* Header tracking for disas output */
-static bool disas_header_written __attribute__((unused));   /* Track if header written to disas */
+static bool disas_header_written;
+
+/* ========== Syscall-Based Library Detection ========== */
+
+static GHashTable *tracked_fds;
+static GByteArray *read_buf;
+
+/* Pending syscall state (correlate entry <-> return) */
+static int64_t pending_syscall_num;
+static bool pending_openat_is_target;
+static uint64_t pending_mmap_fd;
+static uint64_t pending_mmap_prot;
+static uint64_t pending_mmap_offset;
+
+#define SYS_OPENAT_RV64  56
+#define SYS_MMAP_RV64    222
+#define PROT_EXEC_FLAG   4
 
 static void free_bb(void *data)
 {
@@ -70,45 +86,103 @@ static void free_bb(void *data)
 }
 
 /*
- * Parse /proc/self/maps to find the base address of a shared library.
- * In QEMU user-mode, guest memory is mapped in the host process,
- * so we can parse host's /proc/self/maps to find library mappings.
- * Returns 0 if library not found.
+ * Syscall entry callback.
+ * Tracks openat (56) to find when the target library is opened,
+ * and mmap (222) to save arguments for use in the return callback.
+ *
+ * RISC-V syscall arg mapping:
+ *   callback a1..a8 = guest a0..a7
+ *   openat: a2(guest a1)=pathname, mmap: a3(guest a2)=prot, a5(guest a4)=fd, a6(guest a5)=offset
  */
-static uint64_t find_library_base(const char *lib_pattern)
+static void vcpu_syscall(qemu_plugin_id_t id, unsigned int vcpu_index,
+                         int64_t num, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5,
+                         uint64_t a6, uint64_t a7, uint64_t a8)
 {
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps) {
-        qemu_plugin_outs("BBV: Failed to open /proc/self/maps\n");
-        return 0;
-    }
+    if (state == STATE_RECORDING) return;
 
-    char line[512];
-    uint64_t base = 0;
+    pending_syscall_num = num;
 
-    while (fgets(line, sizeof(line), maps)) {
-        /* Look for the library in the mappings */
-        if (strstr(line, lib_pattern)) {
-            /* Parse the start address from the line */
-            /* Format: "7f1234560000-7f1234570000 r-xp ... libname" */
-            uint64_t start, end;
-            char perms[5];
-            if (sscanf(line, "%" PRIx64 "-%" PRIx64 " %4s", &start, &end, perms) == 3) {
-                /* Only consider executable mappings (r-xp) */
-                if (perms[1] == 'x') {
-                    base = start;
-                    g_autofree gchar *msg = g_strdup_printf(
-                        "BBV: Library '%s' found at 0x%" PRIx64 " (size 0x%" PRIx64 ")\n",
-                        lib_pattern, base, end - start);
-                    qemu_plugin_outs(msg);
-                    break;
-                }
-            }
+    if (num == SYS_OPENAT_RV64 && lib_name) {
+        g_byte_array_set_size(read_buf, 0);
+        if (qemu_plugin_read_memory_vaddr(a2, read_buf, 256)) {
+            g_byte_array_append(read_buf, (const guint8 *)"", 1);
+            pending_openat_is_target = strstr((const char *)read_buf->data, lib_name) != NULL;
+        } else {
+            pending_openat_is_target = false;
         }
     }
 
-    fclose(maps);
-    return base;
+    if (num == SYS_MMAP_RV64) {
+        pending_mmap_fd = a5;
+        pending_mmap_prot = a3;
+        pending_mmap_offset = a6;
+    }
+}
+
+/*
+ * Syscall return callback.
+ * Completes openat tracking (fd -> library) and mmap detection (base address).
+ *
+ * Strategy:
+ *   1. First mmap (offset=0) for tracked fd maps LOAD[0] at the ELF base.
+ *      For PIC shared libs, LOAD[0] has p_vaddr=0, so ret IS the base.
+ *   2. Wait for the RE (PROT_EXEC) mmap to confirm the text segment is mapped.
+ *   3. func_addr = elf_base + nm_offset (nm offsets are virtual addresses).
+ */
+static void vcpu_syscall_ret(qemu_plugin_id_t id, unsigned int vcpu_idx,
+                             int64_t num, int64_t ret)
+{
+    if (state == STATE_RECORDING) return;
+
+    /* openat return: record fd if it belongs to our target library */
+    if (num == SYS_OPENAT_RV64 && pending_openat_is_target && ret >= 0) {
+        g_hash_table_add(tracked_fds, GINT_TO_POINTER((int)ret));
+        pending_openat_is_target = false;
+    }
+
+    static uint64_t lib_base_addr = 0;
+    static bool base_detected = false;
+
+    if (num == SYS_MMAP_RV64 && ret > 0 &&
+        g_hash_table_contains(tracked_fds, GINT_TO_POINTER((int)pending_mmap_fd))) {
+
+        if (!base_detected && pending_mmap_offset == 0) {
+            lib_base_addr = (uint64_t)ret;
+            base_detected = true;
+        }
+
+        if ((pending_mmap_prot & PROT_EXEC_FLAG) && base_detected) {
+            /* Text segment mapped. Calculate function address from ELF base. */
+            func_start_vaddr = lib_base_addr + func_offset;
+            func_end_vaddr = func_start_vaddr + target_func_size;
+            state = STATE_RECORDING;
+
+            if (disas_file && !disas_header_written) {
+                uint64_t text_seg_p_vaddr = (uint64_t)ret - lib_base_addr;
+                fprintf(disas_file, "# BBV Function-Scoped Mode (Syscall-Based)\n");
+                fprintf(disas_file, "# Library: %s (base 0x%" PRIx64 ")\n",
+                        lib_name, lib_base_addr);
+                fprintf(disas_file, "# Text segment: p_vaddr 0x%" PRIx64
+                        ", file_offset 0x%" PRIx64 "\n",
+                        text_seg_p_vaddr, pending_mmap_offset);
+                fprintf(disas_file, "# Function: offset 0x%" PRIx64
+                        ", size 0x%" PRIx64 "\n",
+                        func_offset, target_func_size);
+                fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                        func_start_vaddr, func_end_vaddr);
+                fprintf(disas_file, "#\n\n");
+                fflush(disas_file);
+                disas_header_written = true;
+            }
+
+            g_autofree gchar *msg = g_strdup_printf(
+                "BBV: Library '%s' mapped at 0x%" PRIx64
+                ", function at 0x%" PRIx64 " - 0x%" PRIx64 "\n",
+                lib_name, lib_base_addr, func_start_vaddr, func_end_vaddr);
+            qemu_plugin_outs(msg);
+        }
+    }
 }
 
 static qemu_plugin_u64 count_u64(void)
@@ -156,7 +230,6 @@ static void plugin_flush(void)
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
-    /* Warn if target function was never detected */
     if (filter_enabled && state == STATE_DETECTING) {
         const char *target_name = target_func_name ? target_func_name :
                                   (lib_name ? lib_name : "(unknown)");
@@ -191,6 +264,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_free(filename);
     g_free(target_func_name);
     g_free(lib_name);
+    if (tracked_fds) {
+        g_hash_table_destroy(tracked_fds);
+    }
+    if (read_buf) {
+        g_byte_array_free(read_buf, TRUE);
+    }
     if (disas_file) {
         fclose(disas_file);
     }
@@ -244,78 +323,48 @@ static void vcpu_interval_exec(unsigned int vcpu_index, void *udata)
 
 /* ========== RISC-V Prologue Detection ========== */
 
-/*
- * Check if instruction is stack allocation (addi sp, sp, -imm)
- * Returns true for negative immediate stack growth.
- */
 static bool is_stack_alloc_insn(uint32_t insn_raw, size_t insn_size)
 {
     if (insn_size == 2) {
-        /* Compressed: C.ADDI16SP (c.addi16sp sp, nzimm) */
         uint16_t insn = (uint16_t)insn_raw;
         uint16_t funct3 = (insn >> 13) & 0x7;
         uint16_t rd = (insn >> 7) & 0x1F;
         uint16_t quadrant = insn & 0x3;
-        /* C.ADDI16SP: funct3=3, rd=sp(2), quadrant=1 */
         return funct3 == 3 && rd == 2 && quadrant == 1;
     } else if (insn_size == 4) {
-        /* 32-bit: ADDI rd=sp(2), rs1=sp(2), imm<0 */
         uint32_t opcode = insn_raw & 0x7F;
         uint32_t rd = (insn_raw >> 7) & 0x1F;
         uint32_t rs1 = (insn_raw >> 15) & 0x1F;
         uint32_t funct3 = (insn_raw >> 12) & 0x7;
-
-        /* Sign-extend 12-bit immediate */
         int32_t imm = (int32_t)((insn_raw >> 20) & 0xFFF);
         if (imm & 0x800) imm |= 0xFFFFF000;
-
-        return opcode == 0x13 &&       /* OP-IMM */
-               funct3 == 0x0 &&        /* ADDI */
-               rd == 2 &&              /* sp (x2) */
-               rs1 == 2 &&             /* sp (x2) */
-               imm < 0;                /* negative = stack growth */
+        return opcode == 0x13 && funct3 == 0x0 && rd == 2 && rs1 == 2 && imm < 0;
     }
     return false;
 }
 
-/*
- * Check if instruction saves callee-saved register to stack.
- * Pattern: sd rs, offset(sp) or c.sd rs, offset(sp)
- */
 static bool is_callee_save_insn(uint32_t insn_raw, size_t insn_size)
 {
     if (insn_size == 2) {
-        /* Compressed: C.SDSP (c.sdsp rs2, offset(sp)) */
         uint16_t insn = (uint16_t)insn_raw;
         uint16_t quadrant = insn & 0x3;
         uint16_t funct3 = (insn >> 13) & 0x7;
-        /* C.SDSP: quadrant=2 (C2), funct3=7, sp is implicit (no rs1 field) */
         return quadrant == 2 && funct3 == 7;
     } else if (insn_size == 4) {
-        /* 32-bit: SD rs2, imm(rs1) */
         uint32_t opcode = insn_raw & 0x7F;
         uint32_t funct3 = (insn_raw >> 12) & 0x7;
         uint32_t rs1 = (insn_raw >> 15) & 0x1F;
-
-        return opcode == 0x23 &&       /* STORE */
-               funct3 == 0x3 &&        /* SD (64-bit) */
-               rs1 == 2;               /* sp base */
+        return opcode == 0x23 && funct3 == 0x3 && rs1 == 2;
     }
     return false;
 }
 
-/*
- * Detect RISC-V function prologue pattern.
- * Typical: addi sp, sp, -N followed by sd ra/s0, offset(sp)
- * Returns true if TB appears to be at function entry.
- */
 __attribute__((unused))
 static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
 {
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
     if (n_insns < 2) return false;
 
-    /* Check first instruction for stack allocation */
     struct qemu_plugin_insn *insn0 = qemu_plugin_tb_get_insn(tb, 0);
     size_t size0 = qemu_plugin_insn_size(insn0);
     uint8_t data0[4] = {0};
@@ -323,17 +372,14 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
     uint32_t raw0 = (size0 == 2) ? *(uint16_t *)data0 : *(uint32_t *)data0;
 
     if (!is_stack_alloc_insn(raw0, size0)) {
-        /* Some leaf functions skip stack allocation, check for sd anyway */
         struct qemu_plugin_insn *insn1 = qemu_plugin_tb_get_insn(tb, 1);
         size_t size1 = qemu_plugin_insn_size(insn1);
         uint8_t data1[4] = {0};
         qemu_plugin_insn_data(insn1, data1, size1);
         uint32_t raw1 = (size1 == 2) ? *(uint16_t *)data1 : *(uint32_t *)data1;
-
         return is_callee_save_insn(raw1, size1);
     }
 
-    /* Stack allocation found, check second for callee-save */
     struct qemu_plugin_insn *insn1 = qemu_plugin_tb_get_insn(tb, 1);
     size_t size1 = qemu_plugin_insn_size(insn1);
     uint8_t data1[4] = {0};
@@ -346,8 +392,8 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
 /*
  * Detect target function by:
  * 1. Symbol name matching (for statically linked or main program symbols)
- * 2. Address range detection via library base + offset (for shared libraries)
- * On match, computes address range and switches to RECORDING.
+ * 2. Direct address mode (func_addr + func_size specified)
+ * Method 3 (lib_name + func_offset) is handled by syscall callbacks.
  */
 static void detect_target_symbol(struct qemu_plugin_tb *tb)
 {
@@ -356,12 +402,11 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
 
     detect_insn_count += n_insns;
 
-    /* Timeout check: after MAX_DETECT_INSNS, use first symbol match */
     if (detect_insn_count > MAX_DETECT_INSNS && state == STATE_DETECTING) {
         qemu_plugin_outs("BBV: Detection timeout - checking final symbols\n");
     }
 
-    /* Method 1: Symbol name matching (for main program symbols) */
+    /* Method 1: Symbol name matching */
     if (target_func_name) {
         for (size_t i = 0; i < n_insns; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
@@ -369,57 +414,49 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
 
             if (sym && g_strcmp0(sym, target_func_name) == 0) {
                 symbol_match_count++;
-
                 bool is_entry = is_riscv_function_entry(tb);
 
                 if (is_entry || detect_insn_count > MAX_DETECT_INSNS) {
-                    /* Found function entry (or timeout fallback) */
                     func_start_vaddr = tb_vaddr;
                     func_end_vaddr = func_start_vaddr + target_func_size;
                     state = STATE_RECORDING;
 
-                    /* Write header to disas file immediately */
-                    if (disas_file) {
+                    if (disas_file && !disas_header_written) {
                         fprintf(disas_file, "# BBV Function-Scoped Mode\n");
                         fprintf(disas_file, "# Target: %s (size 0x%" PRIx64 ")\n",
                                 target_func_name, target_func_size);
                         fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
                                 func_start_vaddr, func_end_vaddr);
                         fprintf(disas_file, "#\n\n");
+                        disas_header_written = true;
                     }
 
-                    /* Log detection info */
                     g_autofree gchar *msg = g_strdup_printf(
                         "BBV: Target function '%s' detected at 0x%" PRIx64
                         " (size 0x%" PRIx64 ", end 0x%" PRIx64 ")%s\n",
-                        target_func_name, func_start_vaddr, target_func_size, func_end_vaddr,
-                        is_entry ? "" : " [timeout fallback]");
+                        target_func_name, func_start_vaddr, target_func_size,
+                        func_end_vaddr, is_entry ? "" : " [timeout fallback]");
                     qemu_plugin_outs(msg);
                     return;
-                } else {
-                    g_autofree gchar *msg = g_strdup_printf(
-                        "BBV: Symbol '%s' matched at 0x%" PRIx64 " but not prologue (match #%d)\n",
-                        target_func_name, tb_vaddr, symbol_match_count);
-                    qemu_plugin_outs(msg);
                 }
             }
         }
     }
 
-    /* Method 2: Direct address mode (func_addr + func_size specified) */
+    /* Method 2: Direct address mode */
     if (func_addr > 0 && target_func_size > 0 && state == STATE_DETECTING) {
-        /* User provided exact runtime address - use directly */
         func_start_vaddr = func_addr;
         func_end_vaddr = func_addr + target_func_size;
         state = STATE_RECORDING;
 
-        if (disas_file) {
+        if (disas_file && !disas_header_written) {
             fprintf(disas_file, "# BBV Function-Scoped Mode (Direct Address)\n");
             fprintf(disas_file, "# Function address: 0x%" PRIx64 "\n", func_addr);
             fprintf(disas_file, "# Function size: 0x%" PRIx64 "\n", target_func_size);
             fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
                     func_start_vaddr, func_end_vaddr);
             fprintf(disas_file, "#\n\n");
+            disas_header_written = true;
         }
 
         g_autofree gchar *msg = g_strdup_printf(
@@ -429,53 +466,7 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
         return;
     }
 
-    /* Method 3: Address-based detection for shared libraries */
-    if (lib_name && func_offset > 0 && state == STATE_DETECTING) {
-        /* Check if this TB is near our expected function address */
-        /* The library base is detected once, then we check if TB falls in range */
-        static uint64_t lib_base = 0;
-        static bool lib_searched = false;
-
-        if (!lib_searched) {
-            lib_base = find_library_base(lib_name);
-            lib_searched = true;
-
-            if (lib_base > 0) {
-                func_start_vaddr = lib_base + func_offset;
-                func_end_vaddr = func_start_vaddr + target_func_size;
-
-                g_autofree gchar *msg = g_strdup_printf(
-                    "BBV: Calculated function address: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
-                    func_start_vaddr, func_end_vaddr);
-                qemu_plugin_outs(msg);
-            }
-        }
-
-        /* If we have a calculated address, check if this TB falls in range */
-        if (lib_base > 0 && func_start_vaddr > 0) {
-            /* Check if TB address matches our expected function start */
-            if (tb_vaddr == func_start_vaddr) {
-                state = STATE_RECORDING;
-
-                if (disas_file) {
-                    fprintf(disas_file, "# BBV Function-Scoped Mode (Address-Based)\n");
-                    fprintf(disas_file, "# Library: %s (base 0x%" PRIx64 ")\n",
-                            lib_name, lib_base);
-                    fprintf(disas_file, "# Function: offset 0x%" PRIx64 ", size 0x%" PRIx64 "\n",
-                            func_offset, target_func_size);
-                    fprintf(disas_file, "# Range: 0x%" PRIx64 " - 0x%" PRIx64 "\n",
-                            func_start_vaddr, func_end_vaddr);
-                    fprintf(disas_file, "#\n\n");
-                }
-
-                g_autofree gchar *msg = g_strdup_printf(
-                    "BBV: Function detected at expected address 0x%" PRIx64 "\n",
-                    func_start_vaddr);
-                qemu_plugin_outs(msg);
-                return;
-            }
-        }
-    }
+    /* Method 3: lib_name + func_offset — handled by syscall callbacks */
 }
 
 static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
@@ -489,18 +480,18 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         switch (state) {
         case STATE_DETECTING:
             detect_target_symbol(tb);
-            return;  /* No instrumentation during detection */
+            return;
 
         case STATE_RECORDING:
-            /* Only instrument if within target function range */
             if (vaddr < func_start_vaddr || vaddr >= func_end_vaddr) {
-                return;  /* Skip BBs outside target function */
+                return;
             }
-            break;  /* Proceed to instrument this BB */
+            break;
         }
     }
 
     /* ========== Normal Instrumentation ========== */
+
     g_rw_lock_writer_lock(&bbs_lock);
     bb = g_hash_table_lookup(bbs, &vaddr);
     if (!bb) {
@@ -556,7 +547,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             detect_insn_count = 0;
             symbol_match_count = 0;
             disas_header_written = false;
-            tokens[1] = NULL;  /* Prevent double-free */
+            tokens[1] = NULL;
         } else if (g_strcmp0(tokens[0], "func_size") == 0) {
             target_func_size = g_ascii_strtoull(tokens[1], NULL, 0);
         } else if (g_strcmp0(tokens[0], "lib_name") == 0) {
@@ -601,7 +592,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     g_autofree gchar *disas_filename = g_strdup_printf("%s.disas", filename);
     disas_file = fopen(disas_filename, "w");
     if (!disas_file) {
-        fprintf(stderr, "bbv: failed to open %s for writing — disassembly output disabled\n", disas_filename);
+        fprintf(stderr, "bbv: failed to open %s for writing — disassembly output disabled\n",
+                disas_filename);
     }
 
     bbs = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, free_bb);
@@ -609,6 +601,14 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+
+    /* Register syscall callbacks for library detection */
+    if (lib_name && func_offset > 0) {
+        tracked_fds = g_hash_table_new(g_direct_hash, g_direct_equal);
+        read_buf = g_byte_array_new();
+        qemu_plugin_register_vcpu_syscall_cb(id, vcpu_syscall);
+        qemu_plugin_register_vcpu_syscall_ret_cb(id, vcpu_syscall_ret);
+    }
 
     return 0;
 }

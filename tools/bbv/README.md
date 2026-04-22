@@ -44,40 +44,53 @@ qemu-riscv64 -L sysroot \
   ./binary
 ```
 
-### Method 2: Direct Address Mode (Shared Libraries)
+### Method 2: Syscall-Based Library Detection (Shared Libraries)
 
-For shared library functions where symbol detection doesn't work in QEMU user-mode:
+**Recommended for shared library profiling.** Automatically detects library
+loading via `openat`/`mmap` syscall interception — no preliminary full-program
+run needed.
 
-#### 1. Run full-program BBV to find function address
-
-```bash
-# First run with ASLR disabled for consistent addresses
-setarch x86_64 -R \
-  qemu-riscv64 -L sysroot -E LD_LIBRARY_PATH=lib \
-  -plugin libbbv.so,interval=100000,outfile=output/full \
-  ./binary
-
-# Find target function in disas output (look for characteristic instructions)
-grep -A5 "vsetivli.*zero,16,e32" output/full.disas
-# Output: BB N (vaddr: 0x7ffff66dedee, ...) shows function prologue
-```
-
-#### 2. Get function size from nm
+#### 1. Get function offset and size from nm
 
 ```bash
 nm -D -S lib/libggml-cpu.so | grep <function_name>
 # Example: 00000000000ac9a4 000000000000030a T ggml_gemv_q4_0_16x1_q8_0
+#          ^offset                        ^size
 ```
 
-#### 3. Calculate decimal address
+#### 2. Run with library detection
 
-```python3
-addr = 0x7ffff66dedee  # from step 1
-size = 0x30a           # from step 2
-print(f"Address: {addr}, Size: {size}")
+```bash
+qemu-riscv64 -L sysroot -E LD_LIBRARY_PATH=lib -cpu max \
+  -plugin libbbv.so,lib_name=libggml-cpu,func_offset=0xac9a4,func_size=0x30a,interval=1000,outfile=output/gemv \
+  ./llama-completion -m model.gguf -p "Hello" -n 20
 ```
 
-#### 4. Run with direct address
+**How it works:**
+1. Intercepts `openat` syscalls to detect when the target library is opened
+2. Tracks the file descriptor
+3. Intercepts `mmap` syscalls to detect where the library's text segment is mapped
+4. Calculates function address: `base + nm_offset`
+5. Begins recording only BBs within the target function range
+
+**Example with llama.cpp:**
+```bash
+# Get offset from nm (one-time)
+nm -D -S lib/libggml-cpu.so | grep gemv_q4_0_16x1_q8_0
+# → 00000000000ac9a4 000000000000030a T ggml_gemv_q4_0_16x1_q8_0
+
+# Run — no preliminary full-program run needed!
+qemu-riscv64 -L llama-sysroot -E LD_LIBRARY_PATH=llama-lib -cpu max \
+  -plugin libbbv.so,lib_name=libggml-cpu,func_offset=0xac9a4,func_size=0x30a,interval=1000,outfile=output/gemv \
+  llama-bin/llama-completion -m model.gguf -p "Hello" -n 20
+```
+
+**Note:** The function must actually be called during execution. Use `nm` to
+verify the offset matches the library version being loaded.
+
+### Method 3: Direct Address Mode
+
+For when you already know the runtime address (e.g., from a previous run):
 
 ```bash
 setarch x86_64 -R \
@@ -86,42 +99,19 @@ setarch x86_64 -R \
   ./binary
 ```
 
-**Example with llama.cpp:**
-```bash
-# Step 1: Find gemv function address
-setarch x86_64 -R timeout 60 \
-  qemu-riscv64 -L llama-sysroot -E LD_LIBRARY_PATH=llama-lib -cpu max \
-  -plugin libbbv.so,interval=100000,outfile=output/qwen-full \
-  llama-bin/llama-completion -m model.gguf -p "Hello" -n 10
-
-grep -A5 "addi.*sp,sp,-144" output/qwen-full.disas | grep vsetivli
-# Found: 0x7ffff66dedee
-
-# Step 2: Run function-scoped BBV
-setarch x86_64 -R timeout 60 \
-  qemu-riscv64 -L llama-sysroot -E LD_LIBRARY_PATH=llama-lib -cpu max \
-  -plugin libbbv.so,func_addr=140737327787502,func_size=778,interval=1000,outfile=output/gemv \
-  llama-bin/llama-completion -m model.gguf -p "Hello" -n 20
-```
+Requires ASLR disabled (`setarch x86_64 -R`) for consistent addresses.
 
 ## Parameters
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `func_name` | Symbol name (main program) | `ggml_gemv_q4_0_16x1_q8_0` |
-| `func_addr` | Direct runtime address (decimal) | `140737327787502` |
+| `lib_name` | Library name for syscall detection | `libggml-cpu` |
+| `func_offset` | Static offset from nm (hex) | `0xac9a4` |
 | `func_size` | Function size (hex or decimal) | `0x30a` or `778` |
-| `lib_name` | Library name for detection | `libggml-cpu` |
-| `func_offset` | Static offset from nm | `0xac9a4` |
+| `func_addr` | Direct runtime address (decimal) | `140737327787502` |
 | `interval` | BBV output interval | `10000` |
 | `outfile` | Output file prefix | `output/result` |
-
-## Behavior
-
-- **Without filtering**: Original behavior (full-program recording)
-- **func_name mode**: Symbol lookup + RISC-V prologue verification
-- **func_addr mode**: Direct address range filtering (requires ASLR disabled)
-- **lib_name+func_offset mode**: Library base detection (experimental)
 
 ## Output Format
 
@@ -135,9 +125,17 @@ T:<bb_index>:<count> ...
 - Header: Function info (mode, address, size, range)
 - Basic blocks: Address, instruction count, disassembly
 
+## Detection Methods Summary
+
+| Method | Use Case | Requires ASLR off | Two-pass |
+|--------|----------|-------------------|----------|
+| `func_name` | Main program symbols | No | No |
+| `lib_name` + `func_offset` | Shared libraries | No | No |
+| `func_addr` | Known runtime address | Yes | No |
+
 ## Limitations
 
-- **Symbol-based detection**: Only works for main program symbols (not shared libraries)
-- **Direct address mode**: Requires ASLR disabled (`setarch x86_64 -R`) for consistent addresses
-- **Address discovery**: Must run full-program BBV first to find function address
-- Dynamic linking symbol resolution: QEMU user-mode doesn't resolve shared library symbols via `qemu_plugin_insn_symbol()`
+- **Symbol-based detection** (`func_name`): Only works for main program symbols — `qemu_plugin_insn_symbol()` does not resolve shared library symbols
+- **Syscall-based detection** (`lib_name`): The target function must actually execute during the run; if it doesn't, no BBV data is recorded
+- **Direct address mode** (`func_addr`): Requires ASLR disabled for consistent addresses across runs
+- **RISC-V only**: Syscall numbers (openat=56, mmap=222) are RISC-V specific
