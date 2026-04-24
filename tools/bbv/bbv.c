@@ -343,7 +343,7 @@ static bool is_stack_alloc_insn(uint32_t insn_raw, size_t insn_size)
     return false;
 }
 
-static bool is_callee_save_insn(uint32_t insn_raw, size_t insn_size)
+static bool is_stack_store_to_sp(uint32_t insn_raw, size_t insn_size)
 {
     if (insn_size == 2) {
         uint16_t insn = (uint16_t)insn_raw;
@@ -359,7 +359,6 @@ static bool is_callee_save_insn(uint32_t insn_raw, size_t insn_size)
     return false;
 }
 
-__attribute__((unused))
 static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
 {
     size_t n_insns = qemu_plugin_tb_n_insns(tb);
@@ -377,7 +376,7 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
         uint8_t data1[4] = {0};
         qemu_plugin_insn_data(insn1, data1, size1);
         uint32_t raw1 = (size1 == 2) ? *(uint16_t *)data1 : *(uint32_t *)data1;
-        return is_callee_save_insn(raw1, size1);
+        return is_stack_store_to_sp(raw1, size1);
     }
 
     struct qemu_plugin_insn *insn1 = qemu_plugin_tb_get_insn(tb, 1);
@@ -386,7 +385,7 @@ static bool is_riscv_function_entry(struct qemu_plugin_tb *tb)
     qemu_plugin_insn_data(insn1, data1, size1);
     uint32_t raw1 = (size1 == 2) ? *(uint16_t *)data1 : *(uint32_t *)data1;
 
-    return is_callee_save_insn(raw1, size1) || n_insns > 2;
+    return is_stack_store_to_sp(raw1, size1);
 }
 
 /*
@@ -403,7 +402,11 @@ static void detect_target_symbol(struct qemu_plugin_tb *tb)
     detect_insn_count += n_insns;
 
     if (detect_insn_count > MAX_DETECT_INSNS && state == STATE_DETECTING) {
-        qemu_plugin_outs("BBV: Detection timeout - checking final symbols\n");
+        static bool timeout_emitted = false;
+        if (!timeout_emitted) {
+            qemu_plugin_outs("BBV: Detection timeout - checking final symbols\n");
+            timeout_emitted = true;
+        }
     }
 
     /* Method 1: Symbol name matching */
@@ -579,8 +582,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         return -1;
     }
 
-    if (func_addr > 0 && target_func_size == 0) {
-        fputs("func_size required when func_addr is specified\n", stderr);
+    if (filter_enabled && target_func_size == 0) {
+        fputs("func_size required for function-scoped recording\n", stderr);
         return -1;
     }
 
