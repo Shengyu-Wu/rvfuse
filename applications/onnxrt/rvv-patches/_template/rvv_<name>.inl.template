@@ -1,0 +1,41 @@
+// rvv_<name>.inl — RVV implementation of <function_name>
+//
+// Single source of truth. Included by:
+//   - onnxruntime/core/mlas/lib/<target>.cpp  (via patch, production build)
+//   - test.cpp                                (correctness test)
+//
+// Prerequisites before including this file:
+//   - Required types (MLAS_FLOAT32X4, MLAS_INT32X4) must be defined
+//   - Required constants must be available
+//   - On RVV targets: <riscv_vector.h> must be included
+//   - On non-RVV targets: __riscv_v_intrinsic will be undefined,
+//     so the fallback path runs instead
+
+#include <cassert>
+
+#if defined(__riscv_v_intrinsic)
+#include <riscv_vector.h>
+#endif
+
+// =============================================================================
+// RVV implementation: <function_name>
+// =============================================================================
+// <Description of what this function does>
+//
+// Algorithm:
+//   1. <Step 1>
+//   2. <Step 2>
+//   ...
+
+inline void <function_name>_rvv(<parameters>) {
+    <implementation>
+}
+
+// Wrapper function that selects RVV or generic based on compile-time detection
+inline void <function_name>(<parameters>) {
+#if defined(__riscv_v_intrinsic)
+    <function_name>_rvv(<parameter_names>);
+#else
+    <function_name>_generic(<parameter_names>);
+#endif
+}

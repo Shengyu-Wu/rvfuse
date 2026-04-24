@@ -1,0 +1,70 @@
+// test.cpp — correctness test for RVV <function_name>
+//
+// Compares the RVV vectorized implementation against the scalar (generic)
+// reference on deterministic pseudo-random data.
+//
+// Build (rv64gcv, VLEN=256):
+//   riscv64-unknown-linux-gnu-clang++ -std=c++17 -O2 \
+//       --target=riscv64-unknown-linux-gnu --sysroot=<sysroot> \
+//       -march=rv64gcv_zvl256b -mabi=lp64d \
+//       -D__riscv_v_intrinsic -o test test.cpp -lm
+
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <cassert>
+#include <cstring>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Minimal MLAS type definitions (copied from MLAS headers)
+// ---------------------------------------------------------------------------
+// <Add required type definitions here>
+
+// ---------------------------------------------------------------------------
+// Scalar (generic) reference implementation
+// ---------------------------------------------------------------------------
+#if defined(__riscv_v_intrinsic)
+__attribute__((optnone))
+#endif
+static void <function_name>_generic(<parameters>) {
+    <scalar_reference_implementation>
+}
+
+// ---------------------------------------------------------------------------
+// RVV vectorized implementation — single source of truth
+// ---------------------------------------------------------------------------
+#include "rvv_<name>.inl"
+
+// ---------------------------------------------------------------------------
+// Pseudo-random data generator (LCG, deterministic)
+// ---------------------------------------------------------------------------
+static uint32_t rng_state = 42;
+
+static uint32_t rng_next() {
+    rng_state = rng_state * 1103515245 + 12345;
+    return (rng_state >> 16) & 0x7FFF;
+}
+
+// <Add rng helper functions as needed>
+
+// ---------------------------------------------------------------------------
+// Test runner
+// ---------------------------------------------------------------------------
+static int run_test(<test_parameters>, const char * label) {
+    <test_implementation>
+}
+
+int main() {
+    printf("=== <function_name>: RVV vs Scalar correctness test ===\n\n");
+
+    int failures = 0;
+
+    // Add test cases
+    failures += run_test(<params>, "test-1");
+
+    printf("\n=== Summary: %d test(s) failed ===\n", failures);
+    return failures;
+}

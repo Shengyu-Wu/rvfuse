@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PATCH_FILE="${PROJECT_ROOT}/applications/yolo/patches/mlas/rvv-gemm-vl16.patch"
+PATCH_FILE="${PROJECT_ROOT}/applications/onnxrt/rvv-patches/sgemm-kernel-vl16/patch.diff"
 ORT_BUILD_DIR="${PROJECT_ROOT}/output/ort-vl16-build"
 ORT_INSTALL_DIR="${PROJECT_ROOT}/output/ort-vl16"
 SYSROOT="${PROJECT_ROOT}/output/sysroot"
