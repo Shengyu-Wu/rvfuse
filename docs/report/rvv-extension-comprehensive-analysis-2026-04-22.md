@@ -287,7 +287,7 @@ vfmacc.vv_lane vd, vs1, vs2, imm[5-bit]
 
 **收益量化（基于实际RVV SGEMM实现 + 指令延迟表）**：
 
-参考 `applications/yolo/patches/rvv-gemm-vl16.patch` 中 VL=16 内核实现，以 K=2 展开、ProcessTwoRows 模式为例：
+参考 `applications/onnxrt/rvv-patches/sgemm-kernel-vl16/rvv_sgemm_kernel_vl16.inl` 中 VL=16 内核实现，以 K=2 展开、ProcessTwoRows 模式为例：
 
 **关键指令延迟（来自 `docs/reference/cx/instruction-constraints-and-latency.md`）**：
 

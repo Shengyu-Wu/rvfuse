@@ -4,19 +4,19 @@
     {
       "id": 1,
       "prompt": "我想在香蕉派上对 ResNet50 做 perf profiling，用 generic_ort_runner 跑 30 次迭代，采样 999Hz。板子 IP 是 192.168.1.22，密码 bianbu。",
-      "expected_output": "Agent runs: python3 tools/perf_scalar_profile.py --host 192.168.1.22 --user root --password bianbu --remote-dir /root/ort-perf --runner output/cross-ort/generic_ort_runner --libs output/cross-ort/lib --sysroot output/cross-ort/sysroot --models output/models/resnet50.onnx --iterations 30 --freq 999 --outdir output/perf/ort. Explains the upload-profile-download workflow. Auto-detects framework as 'ort' from .onnx extension.",
+      "expected_output": "Agent follows the perf-profiling phases: (1) resolves 'resnet50' from model registry, downloads if needed. (2) Detects framework as 'ort' from .onnx extension, finds rootfs.tar.gz for chroot mode. (3) Uploads rootfs.tar.gz and model via scp, extracts rootfs, copies model into it. (4) Sets up chroot mounts, runs perf stat + perf record (cpu-clock, -F 999) + perf report + perf annotate via ssh. (5) Downloads perf_stat.txt, perf_report.txt, perf_annotate.txt via scp. (6) Generates summary.md with metrics table.",
       "files": []
     },
     {
       "id": 2,
       "prompt": "帮我对 ResNet50、MobileNetV2 两个模型做批量 perf profiling，对比热点函数。香蕉派 192.168.1.22，密码 bianbu。",
-      "expected_output": "Agent runs perf_scalar_profile.py with --models resnet50.onnx mobilenetv2.onnx --iterations 30 --freq 999. Reads the generated summary.md and compares top functions, IPC, and cycles across models. Identifies shared hot functions as priority fusion targets. Notes cpu-clock event is used for RISC-V.",
+      "expected_output": "Agent profiles both models sequentially using the perf-profiling phases: resolves both models, uploads them, runs perf stat/record/report/annotate for each, downloads results. Generates summary.md comparing top functions, IPC, cycles, and cache miss rates across both models. Identifies shared hot functions as priority fusion targets. Notes cpu-clock event is used for RISC-V.",
       "files": []
     },
     {
       "id": 3,
       "prompt": "帮我对 Qwen2.5-0.5B-Q4_0.gguf 用 llama.cpp 做 perf profiling，prompt 是 'Hello world'，生成 128 tokens。香蕉派 192.168.1.22。",
-      "expected_output": "Agent runs: python3 tools/perf_scalar_profile.py --host 192.168.1.22 --user root --password bianbu --runner output/llama.cpp/bin/llama-cli --libs output/llama.cpp/lib --sysroot output/llama.cpp/sysroot --models Qwen2.5-0.5B-Q4_0.gguf --input '-p \"Hello world\" -n 128' --outdir output/perf/llama. Auto-detects framework as 'llama' from .gguf extension. Builds llama-cli command with -m flag.",
+      "expected_output": "Agent follows perf-profiling phases: (1) resolves 'qwen-0.5b-q4_0' from registry, downloads GGUF. (2) Detects framework as 'llama' from .gguf extension, uses direct mode (no rootfs). (3) Uploads llama-cli binary, shared libs, and model via scp. (4) Runs perf with LD_LIBRARY_PATH, uses runner command 'llama-cli -m <model.gguf> -p \"Hello world\" -n 128'. (5) Downloads and summarizes results.",
       "files": []
     },
     {

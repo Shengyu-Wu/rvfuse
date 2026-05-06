@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-cpu/CMakeLists.txt b/ggml/src/ggml-cpu/CMakeLists.txt
+index beebc47..5a915c7 100644
+--- a/ggml/src/ggml-cpu/CMakeLists.txt
++++ b/ggml/src/ggml-cpu/CMakeLists.txt
+@@ -486,6 +486,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
+                 string(APPEND MARCH_STR "_zihintpause")
+             endif()
+ 
++            # VLEN configuration (must match target hardware)
++            # Default: LLVM uses zvl128b (VLEN=128) which may not dispatch VLEN=256 kernels
++            if (GGML_RV_ZVL256B)
++                string(APPEND MARCH_STR "_zvl256b")
++            elseif (GGML_RV_ZVL512B)
++                string(APPEND MARCH_STR "_zvl512b")
++            elseif (GGML_RV_ZVL1024B)
++                string(APPEND MARCH_STR "_zvl1024b")
++            endif()
++
+             list(APPEND ARCH_FLAGS "-march=${MARCH_STR}" -mabi=lp64d)
+         else()
+             # Begin with the lowest baseline

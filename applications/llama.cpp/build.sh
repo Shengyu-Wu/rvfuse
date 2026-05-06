@@ -294,6 +294,7 @@ cross_compile() {
         -DGGML_RV_ZFH=ON \
         -DGGML_RV_ZICBOP=ON \
         -DGGML_RV_ZIHINTPAUSE=ON \
+        -DGGML_RV_ZVL256B=ON \
         -DLLAMA_OPENSSL=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=ON \

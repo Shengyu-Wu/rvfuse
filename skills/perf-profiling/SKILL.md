@@ -2,10 +2,11 @@
 name: perf-profiling
 description: |
   Profile RISC-V inference workloads on real hardware (Banana Pi) using Linux perf.
-  Uploads cross-compiled binaries, shared libraries, sysroot, and models from the
-  development machine via SSH/paramiko, runs perf profiling, pulls results back.
-  Supports both ONNX Runtime (generic_ort_runner) and llama.cpp frameworks.
-  Auto-detects framework from model file extension (.onnx / .gguf).
+  Handles the full workflow: model download, artifact upload via scp, perf profiling
+  via ssh, result download, and summary generation. Supports ONNX Runtime
+  (generic_ort_runner) and llama.cpp frameworks. Auto-detects framework from model
+  file extension (.onnx / .gguf). No external scripts required — all steps executed
+  directly via ssh/scp commands.
   Use this skill when the user mentions: perf profiling, hardware profiling,
   香蕉派 profiling, real hardware hotspot, instruction fusion hotspot discovery,
   多模型 profiling, perf stat, perf record, perf annotate, remote profiling,
@@ -15,9 +16,194 @@ description: |
 # Perf Profiling on RISC-V Hardware
 
 Profile inference workloads on real RISC-V hardware (Banana Pi) using Linux `perf`.
-Upload cross-compiled binaries from the development machine, run perf on the board,
-pull results back. Unlike QEMU BBV profiling, hardware perf captures real cycle counts,
-cache behavior, and branch prediction effects.
+Execute the full workflow directly via `ssh`/`scp` — no Python scripts needed.
+
+Unlike QEMU BBV profiling, hardware perf captures real cycle counts, cache behavior,
+and branch prediction effects.
+
+## Execution Phases
+
+Follow these phases in order. Adapt commands based on the user's request (framework,
+models, iterations, etc.).
+
+### Phase 1: Model Resolution
+
+Resolve each model the user specifies. Resolution order:
+1. Exact local file path — use as-is if it exists
+2. `output/models/<basename>` — check if already downloaded
+3. Registry short name — download from URL below
+4. Direct URL — download with `wget`
+
+**Model Registry:**
+
+| Short Name | Framework | Filename | Download URL |
+|------------|-----------|----------|-------------|
+| `resnet50` | ORT | `resnet50.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/resnet/model/resnet50-v2-7.onnx` |
+| `mobilenetv2` | ORT | `mobilenetv2.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-10.onnx` |
+| `squeezenet` | ORT | `squeezenet.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/squeezenet/model/squeezenet1.1-7.onnx` |
+| `shufflenet` | ORT | `shufflenet.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/shufflenet/model/shufflenet-9.onnx` |
+| `vgg16` | ORT | `vgg16.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/vgg/model/vgg16-7.onnx` |
+| `densenet121` | ORT | `densenet121.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/densenet-121/model/densenet-121.onnx` |
+| `inception` | ORT | `inception_v1.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/inception_and_googlenet/inception_v1/model/inception-v1-9.onnx` |
+| `efficientnet-lite4` | ORT | `efficientnet-lite4.onnx` | `https://github.com/onnx/models/raw/main/validated/vision/classification/efficientnet-lite4/model/efficientnet-lite4-11.onnx` |
+| `qwen-0.5b-q4_0` | llama.cpp | `Qwen2.5-0.5B-Instruct-Q4_0.gguf` | `https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_0.gguf` |
+| `qwen-1.5b-q4_0` | llama.cpp | `Qwen2.5-1.5B-Instruct-Q4_0.gguf` | `https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_0.gguf` |
+
+If download needed:
+```bash
+mkdir -p output/models
+wget -q -O output/models/<filename> "<url>"
+```
+
+### Phase 2: Detect Framework and Mode
+
+**Framework detection** from model file extension:
+- `.onnx` / `.ort` → `ort` (ONNX Runtime)
+- `.gguf` → `llama` (llama.cpp)
+
+**Mode detection** — check if `rootfs.tar.gz` exists alongside the runner:
+```bash
+# ORT default: output/cross-ort/rootfs.tar.gz
+# llama.cpp: typically no rootfs, use --libs + --sysroot
+```
+
+If `rootfs.tar.gz` exists → use **chroot mode** (recommended for ORT).
+Otherwise → use **direct mode** with `LD_LIBRARY_PATH`.
+
+### Phase 3: Upload
+
+Collect connection info from user (or use defaults):
+- `HOST`: Banana Pi IP (required)
+- `USER`: SSH username (default: `root`)
+- `REMOTE_DIR`: remote working directory (default: `/root`)
+- `RUNNER`: local path to inference binary
+
+Use `sshpass` for non-interactive password auth, or `ssh-copy-id` for key-based.
+
+```bash
+SSH_CMD="sshpass -p '<password>' ssh -o StrictHostKeyChecking=no <user>@<host>"
+SCP_CMD="sshpass -p '<password>' scp -o StrictHostKeyChecking=no"
+REMOTE=<remote-dir>
+```
+
+#### Chroot Mode (ORT recommended)
+
+```bash
+# Upload and extract rootfs
+$SSH_CMD "mkdir -p $REMOTE"
+$SCP_CMD output/cross-ort/rootfs.tar.gz $REMOTE/rootfs.tar.gz
+$SSH_CMD "cd $REMOTE && tar xzf rootfs.tar.gz"
+
+# Copy models into rootfs
+$SCP_CMD <model_path> $REMOTE/rootfs/<model_filename>
+```
+
+#### Direct Mode (llama.cpp or no rootfs)
+
+```bash
+$SSH_CMD "mkdir -p $REMOTE/lib"
+
+# Upload runner
+$SCP_CMD <runner> $REMOTE/<runner_name>
+$SSH_CMD "chmod +x $REMOTE/<runner_name>"
+
+# Upload shared libraries
+scp <libs_dir>/*.so* $REMOTE/lib/
+
+# Upload sysroot (if needed)
+scp -r <sysroot> $REMOTE/sysroot
+
+# Upload model
+$SCP_CMD <model_path> $REMOTE/<model_filename>
+```
+
+### Phase 4: Setup and Profile
+
+First, check the remote environment:
+
+```bash
+$SSH_CMD "uname -m && perf --version 2>&1"
+$SSH_CMD "cat /proc/sys/kernel/perf_event_paranoid"
+# If paranoid > 1:
+$SSH_CMD "echo 0 > /proc/sys/kernel/perf_event_paranoid"
+```
+
+#### Chroot Setup (if using rootfs)
+
+```bash
+$SSH_CMD "mkdir -p $REMOTE/rootfs/{proc,dev,sys,tmp}"
+$SSH_CMD "mount -t proc proc $REMOTE/rootfs/proc 2>/dev/null || true"
+$SSH_CMD "mount -t sysfs sysfs $REMOTE/rootfs/sys 2>/dev/null || true"
+$SSH_CMD "mount --bind /dev $REMOTE/rootfs/dev 2>/dev/null || true"
+```
+
+#### Build Runner Command
+
+**ORT (chroot mode):**
+```
+run_cmd = "chroot $REMOTE/rootfs /<runner_name> <model_filename> <iterations>"
+```
+
+**ORT (direct mode):**
+```
+run_cmd = "LD_LIBRARY_PATH=$REMOTE/lib $REMOTE/<runner_name> <model_filename> <iterations>"
+```
+
+**llama.cpp:**
+```
+run_cmd = "LD_LIBRARY_PATH=$REMOTE/lib $REMOTE/llama-cli -m $REMOTE/<model.gguf> <input_args>"
+```
+
+#### Run perf (per model)
+
+```bash
+WORK=$REMOTE/perf_<model_stem>
+$SSH_CMD "mkdir -p $WORK"
+
+# 1. perf stat — global metrics
+$SSH_CMD "perf stat -d -o $WORK/perf_stat.txt -- $run_cmd"
+
+# 2. perf record — sampling (cpu-clock for RISC-V, see notes below)
+$SSH_CMD "perf record -e cpu-clock -g -F <freq> -o $WORK/perf.data -- $run_cmd"
+
+# 3. Generate reports
+SYMFS=""
+# If chroot mode: SYMFS="--symfs $REMOTE/rootfs"
+$SSH_CMD "perf report --stdio -n --percent-limit 0.5 $SYMFS -i $WORK/perf.data > $WORK/perf_report.txt 2>/dev/null"
+$SSH_CMD "perf annotate --stdio $SYMFS -i $WORK/perf.data > $WORK/perf_annotate.txt 2>/dev/null"
+```
+
+### Phase 5: Download and Summarize
+
+```bash
+# Create local output directory
+mkdir -p <outdir>/<model_stem>
+
+# Download results
+$SCP_CMD $HOST:$WORK/perf_stat.txt <outdir>/<model_stem>/
+$SCP_CMD $HOST:$WORK/perf_report.txt <outdir>/<model_stem>/
+$SCP_CMD $HOST:$WORK/perf_annotate.txt <outdir>/<model_stem>/
+```
+
+After downloading all models, read the local `perf_stat.txt` and `perf_report.txt`
+files and generate `<outdir>/summary.md` with:
+- Table of models vs. metrics (cycles, instructions, IPC, cache miss %, top function)
+- Top-10 hot functions per model
+- Cross-model shared hot functions → priority fusion targets
+
+### Phase 6: Cleanup
+
+```bash
+# Remove perf data from remote
+$SSH_CMD "rm -rf $REMOTE/perf_<model_stem>"
+
+# If chroot mode, unmount
+$SSH_CMD "umount $REMOTE/rootfs/proc 2>/dev/null || true"
+$SSH_CMD "umount $REMOTE/rootfs/sys 2>/dev/null || true"
+$SSH_CMD "umount $REMOTE/rootfs/dev 2>/dev/null || true"
+```
+
+---
 
 ## Supported Frameworks
 
@@ -46,171 +232,14 @@ Cross-compiled via `applications/llama.cpp/build.sh` (see cross-compile-app skil
 | Sysroot | `output/llama.cpp/sysroot/` | `<remote-dir>/sysroot/` |
 | GGUF models | `*.gguf` files | `<remote-dir>/` |
 
-## Remote Profiling Workflow
-
-Run from your x86 development machine. The script handles everything: model download → upload → profile → download.
-
-### Model Auto-Download
-
-Models can be specified by short name, local path, or URL. If not found locally,
-the script auto-downloads to `output/models/`.
-
-```bash
-# List all available models
-python3 tools/perf_scalar_profile.py --list-models
-```
-
-| Short Name | Framework | Description |
-|------------|-----------|-------------|
-| `resnet50` | ORT | ResNet-50 v2 (98 MB) |
-| `mobilenetv2` | ORT | MobileNetV2 (14 MB) |
-| `squeezenet` | ORT | SqueezeNet 1.1 (5 MB) |
-| `shufflenet` | ORT | ShuffleNet (9 MB) |
-| `vgg16` | ORT | VGG-16 (528 MB) |
-| `densenet121` | ORT | DenseNet-121 |
-| `inception` | ORT | Inception v1 (27 MB) |
-| `efficientnet-lite4` | ORT | EfficientNet-Lite4 |
-| `qwen-0.5b-q4_0` | llama.cpp | Qwen2.5 0.5B Instruct Q4_0 (~350 MB) |
-| `qwen-1.5b-q4_0` | llama.cpp | Qwen2.5 1.5B Instruct Q4_0 (~1 GB) |
-
-Resolution order:
-1. Exact local file path (e.g., `output/models/resnet50.onnx`)
-2. `output/models/<basename>` (e.g., `resnet50` → `output/models/resnet50.onnx`)
-3. Registry download (e.g., `mobilenetv2` → downloads from ONNX Model Zoo)
-4. URL download (e.g., `https://example.com/model.onnx`)
-
-### Connection Config
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--host` | required | Banana Pi IP address |
-| `--user` | `root` | SSH username |
-| `--password` | required | SSH password |
-| `--remote-dir` | `/root` | Remote working directory |
-
-### Usage: ONNX Runtime
-
-```bash
-# Default mode — chroot auto-detected from runner path
-# Looks for output/cross-ort/rootfs.tar.gz automatically
-python3 tools/perf_scalar_profile.py \
-  --host 192.168.1.22 --user root --password bianbu \
-  --remote-dir /root/ort-perf \
-  --runner output/cross-ort/generic_ort_runner \
-  --models resnet50 mobilenetv2 squeezenet \
-  --outdir output/perf/ort \
-  --iterations 30 --freq 999
-
-# Skip upload after first deploy
-python3 tools/perf_scalar_profile.py \
-  --host 192.168.1.22 --user root --password bianbu \
-  --remote-dir /root/ort-perf \
-  --skip-upload \
-  --runner output/cross-ort/generic_ort_runner \
-  --models resnet50 \
-  --iterations 30 --freq 999
-```
-
-### Usage: llama.cpp
-
-```bash
-# Auto-downloads GGUF from HuggingFace
-python3 tools/perf_scalar_profile.py \
-  --host 192.168.1.22 --user root --password bianbu \
-  --remote-dir /root/llama-perf \
-  --runner output/llama.cpp/bin/llama-cli \
-  --libs output/llama.cpp/lib \
-  --sysroot output/llama.cpp/sysroot \
-  --models qwen-0.5b-q4_0 \
-  --input "-p \"Hello world\" -n 128" \
-  --outdir output/perf/llama
-```
-
-### Workflow Diagram
-
-```
-┌──────────────────────────┐                  ┌──────────────────────┐
-│  Dev Machine (x86_64)    │                  │  Banana Pi (rv64gcv) │
-│                          │  1. Upload       │                      │
-│  perf_scalar_profile.py  │─────────────────►│  /root/ort-perf/     │
-│                          │     SFTP         │    generic_ort_runner│
-│                          │                  │    lib/*.so          │
-│                          │                  │    sysroot/          │
-│                          │                  │    *.onnx            │
-│                          │                  │                      │
-│                          │  2. Profile      │                      │
-│                          │─────────────────►│  perf stat -d        │
-│                          │     SSH exec     │  perf record         │
-│                          │                  │    -e cpu-clock -g   │
-│                          │                  │  perf report         │
-│                          │                  │  perf annotate       │
-│                          │                  │                      │
-│  output/perf/ort/        │  3. Download     │                      │
-│    resnet50/             │◄──────────────────│  perf_stat.txt       │
-│      perf_stat.txt       │     SFTP         │  perf_report.txt     │
-│      perf_report.txt     │                  │  perf_annotate.txt   │
-│    summary.md            │  4. Cleanup      │                      │
-│                          │─────────────────►│  rm temp files       │
-└──────────────────────────┘                  └──────────────────────┘
-```
-
-### Script Arguments
-
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--host` | Yes | - | Banana Pi IP address |
-| `--user` | No | `root` | SSH username |
-| `--password` | Yes | - | SSH password |
-| `--runner` | Yes | - | Local path to inference binary |
-| `--models` | Yes | - | Models: short names (`resnet50`), local paths, or URLs |
-| `--models-dir` | No | `output/models` | Local directory for downloaded models |
-| `--list-models` | No | - | List available models and exit |
-| `--input` | No | `""` | Extra args for runner (llama.cpp prompt args) |
-| `--iterations` | No | `30` | Inference iterations for ORT runner |
-| `--libs` | No | - | Local directory with shared libraries (.so) |
-| `--sysroot` | No | - | Local sysroot directory |
-| `--outdir` | No | `output/perf` | Local output directory |
-| `--remote-dir` | No | `/root` | Remote working directory |
-| `--freq` | No | `999` | Sampling frequency (Hz) |
-| `--upload-only` | No | false | Upload files only, skip profiling |
-| `--skip-upload` | No | false | Skip upload (files already on board) |
-| `--rootfs` | No | auto | Local rootfs.tar.gz (auto-detected from runner path) |
-| `--dry-run` | No | false | Print actions without executing |
-
-## Prerequisites
-
-### Remote Board
-
-```bash
-# Verify perf is installed
-perf --version
-
-# If permission denied, lower paranoid level
-sudo sysctl -w kernel.perf_event_paranoid=0
-```
-
-The script automatically checks and sets `perf_event_paranoid=0` if needed.
-
-### Local Machine
-
-```bash
-pip install paramiko
-```
-
-### Cross-Compilation
-
-Use the **cross-compile-app** skill to build ONNX Runtime or llama.cpp for RISC-V
-before profiling. Key flags for good profiling:
-- `-g -fno-omit-frame-pointer` for perf call graph unwinding
-- Do NOT strip shared libraries (symbols needed for `perf report`)
-- Use `generic_ort_runner` for ORT — it auto-detects model input shape
+---
 
 ## RISC-V Perf Notes
 
 ### Software Events Required
 
 Banana Pi (SpacemiT K1) SBI PMU does not reliably support hardware cycle sampling.
-The script uses `-e cpu-clock` (software event) which always works:
+Use `-e cpu-clock` (software event) which always works:
 
 ```bash
 # This works on Banana Pi:
@@ -224,13 +253,13 @@ perf record -e cycles -g -F 999 -- ./runner model.onnx
 
 For meaningful function names in `perf report`:
 1. Build with `-g` (debug info) and without stripping
-2. The `generic_ort_runner` and `yolo_inference` binaries have debug info by default
+2. `generic_ort_runner` and `yolo_inference` binaries have debug info by default
 3. **libonnxruntime.so** must NOT be stripped — build script uses `install` (not `install/strip`)
 4. Shared libs must be in `LD_LIBRARY_PATH` on the remote board
 
-## Profiling Commands (Reference)
+---
 
-These are the commands the script runs remotely. Useful for manual debugging.
+## Profiling Commands (Quick Reference)
 
 ### perf stat — Global Metrics
 
@@ -276,6 +305,8 @@ Output format:
 
 Instructions with >5% are strong fusion candidates.
 
+---
+
 ## Hotspot Analysis for Fusion Candidates
 
 ### Fusion Patterns to Look For
@@ -307,6 +338,8 @@ Instructions with >5% are strong fusion candidates.
 3. **Cross-model overlap**: Shared hot functions = highest priority fusion targets
 4. **Cross-framework overlap**: Functions hot in both ORT and llama.cpp = universal candidates
 
+---
+
 ## Output Directory Convention
 
 ```
@@ -323,26 +356,54 @@ output/perf/
     └── summary.md
 ```
 
+---
+
+## Prerequisites
+
+### Remote Board
+
+```bash
+perf --version
+sudo sysctl -w kernel.perf_event_paranoid=0
+```
+
+### Local Machine
+
+```bash
+# sshpass for non-interactive scp/ssh
+sudo apt install sshpass
+```
+
+### Cross-Compilation
+
+Use the **cross-compile-app** skill to build ONNX Runtime or llama.cpp for RISC-V
+before profiling. Key flags for good profiling:
+- `-g -fno-omit-frame-pointer` for perf call graph unwinding
+- Do NOT strip shared libraries (symbols needed for `perf report`)
+- Use `generic_ort_runner` for ORT — it auto-detects model input shape
+
+---
+
 ## Troubleshooting
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| Permission denied | perf_event_paranoid too high | `sudo sysctl -w kernel.perf_event_paranoid=0` |
-| No symbols (hex addresses) | Binary stripped or no debug info | Build with `-g -fno-omit-frame-pointer`; ensure `install` not `install/strip` |
-| No symbols in chroot mode | perf can't find .so inside rootfs | Script uses `--symfs <rootfs>` automatically |
-| No samples in perf record | Hardware PMU not supported on SBI | Use `-e cpu-clock` (script does this by default) |
-| Too few samples | Low freq or short run | Increase `--freq 9999` or `--iterations 100` |
-| High overhead | Frequency too high | Use `--freq 99` |
-| SSH connection fails | Network or auth issue | Test: `python3 -c "import paramiko; ..."` |
-| glibc version mismatch | Board glibc older than build sysroot | Use `--rootfs` for chroot isolation |
-| chroot fails | No root on board | Script requires root SSH access for chroot/mount |
+| Permission denied | perf_event_paranoid too high | `ssh ... "echo 0 > /proc/sys/kernel/perf_event_paranoid"` |
+| No symbols (hex addresses) | Binary stripped or no debug info | Build with `-g -fno-omit-frame-pointer`; use `install` not `install/strip` |
+| No symbols in chroot mode | perf can't find .so inside rootfs | Use `--symfs <rootfs-path>` in perf report/annotate |
+| No samples in perf record | Hardware PMU not supported on SBI | Use `-e cpu-clock` instead of `-e cycles` |
+| Too few samples | Low freq or short run | Increase `-F 9999` or iterations to 100+ |
+| High overhead | Frequency too high | Use `-F 99` |
+| SSH connection fails | Network or auth issue | Test: `sshpass -p '<pwd>' ssh <user>@<host> uname -m` |
+| glibc version mismatch | Board glibc older than build sysroot | Use rootfs.tar.gz for chroot isolation |
+| chroot fails | No root on board | SSH as root user (default on Banana Pi) |
 
 ## Limitations
 
 | Limitation | Mitigation |
 |------------|------------|
 | SBI PMU events vary by firmware | Check `perf list`; software events always work |
-| perf is statistical, not exact | Increase `--freq` for more resolution |
+| perf is statistical, not exact | Increase `-F` for more resolution |
 | Limited PMU counters | Profile events in separate runs |
 | cpu-clock samples at lower rate | Use high freq (999+) and more iterations (30+) |
 | chroot requires root | SSH as root user (default on Banana Pi) |

@@ -499,6 +499,171 @@ The `_generic` version is the fallback. If only `_generic` exists (no arch-speci
 | 7. Run inference | Use a model that contains the target quant format | Wrong model = kernel never called, no trace output |
 | 8. Remove trace | Restore clean `.inl` before committing | Don't leave debug code in production |
 
+## GEMV Kernel Dispatch and VLEN Configuration
+
+llama.cpp selects GEMV/GEMM kernels at runtime based on `__riscv_vlenb()`, which returns
+the CPU's vector length in bytes. This creates a critical dependency between compile-time
+march flags and runtime kernel selection.
+
+### The VLEN Dispatch Mechanism
+
+The dispatch logic in `vendor/llama.cpp/ggml/src/ggml-cpu/arch/riscv/repack.cpp` (around line 4589):
+
+```cpp
+if (ggml_cpu_has_riscv_v()) {
+    #if defined __riscv_zvfh
+    switch (__riscv_vlenb() * 8) {
+        case 128:  { break; }           // TODO — no implementation
+        case 256:  { if (cur->ne[1] % 16 == 0) { return &q4_0_16x1_q8_0; } break; }
+        case 512:  { break; }           // TODO — no implementation
+        case 1024: { break; }           // TODO — no implementation
+        default:   { return nullptr; }
+    }
+    #endif
+}
+```
+
+**Key insight**: `__riscv_vlenb()` is resolved at **compile time** when `zvl*b` extension is specified.
+Without `zvl256b`, LLVM defaults to `zvl128b`, causing `__riscv_vlenb()` to resolve to `16` (VLEN=128).
+The switch hits `case 128: break` — the VLEN=256 kernel path is **dead-code eliminated**.
+
+### Required Build Configuration for VLEN=256
+
+To ensure the `16x1` GEMV kernel (VLEN=256 variant) is compiled and dispatched:
+
+#### 1. Toolchain file modification
+
+**File**: `riscv64-linux-toolchain.cmake` (lines 23-24)
+
+```cmake
+SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=rv64gcv_zfh_zba_zicbop_zvl256b")
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=rv64gcv_zfh_zba_zicbop_zvl256b")
+```
+
+#### 2. CMake VLEN parameter (CRITICAL)
+
+**Add to build.sh cmake configuration**:
+
+```bash
+cmake ... -DGGML_RV_ZVL256B=ON ...
+```
+
+This cmake option is processed by `rvv-patches/cmake-vlen-config/patch.diff`, which
+adds VLEN configuration support to llama.cpp's CMake. The patch is automatically
+applied by `build.sh`.
+
+**Why this is needed**: llama.cpp's CMake constructs its own `MARCH_STR` that
+overrides the toolchain file's march flags. Without this cmake option, LLVM defaults
+to `zvl128b` (VLEN=128) and the VLEN=256 GEMV kernel path is dead-code eliminated.
+
+#### 3. Verify the build
+
+```bash
+# After rebuild, check ELF attributes for zvl256b
+readelf -A output/llama.cpp/lib/libggml-cpu.so.0 | grep zvl256b
+
+# Expected output includes: zvl256b1p0
+```
+
+### Required QEMU Configuration
+
+Even with `zvl256b` compiled in, QEMU must be configured to match:
+
+```bash
+# WRONG: Default QEMU VLEN=128 → Illegal instruction or silent failure
+qemu-riscv64 -L sysroot -cpu max ./llama-cli ...
+
+# CORRECT: Match VLEN=256
+qemu-riscv64 -L sysroot -cpu max,vlen=256 ./llama-cli ...
+```
+
+Verification in program output:
+
+```
+system_info: n_threads = 11 ... | RISCV_V = 1 | RVV_VLEN = 32 | ...
+```
+
+`RVV_VLEN = 32` means 32 bytes = 256 bits. If it shows `RVV_VLEN = 16`, the kernel
+will NOT be dispatched (VLEN mismatch).
+
+### Adding New GEMV/GEMM Kernels for Different VLEN
+
+When implementing new RVV GEMV/GEMM kernels, you must:
+
+1. **Add kernel implementation**: Create `.inl` file in `vendor/.../arch/riscv/`
+2. **Register in dispatch table**: Modify `repack.cpp` switch statement:
+
+```cpp
+switch (__riscv_vlenb() * 8) {
+    case 128:  { return &my_new_128bit_kernel; break; }  // Add your kernel
+    case 256:  { return &q4_0_16x1_q8_0; break; }         // Existing
+    case 512:  { return &my_new_512bit_kernel; break; }   // Add your kernel
+    ...
+}
+```
+
+3. **Declare function pointer**: Add to the appropriate function pointer table in `repack.cpp`
+4. **Enable VLEN cmake option**: Add appropriate cmake parameter to `build.sh`:
+
+```bash
+# For VLEN=256 kernels
+-DGGML_RV_ZVL256B=ON
+
+# For VLEN=512 kernels
+-DGGML_RV_ZVL512B=ON
+
+# For VLEN=1024 kernels
+-DGGML_RV_ZVL1024B=ON
+```
+
+The cmake-vlen-config patch (in `rvv-patches/cmake-vlen-config/`) handles the CMakeLists.txt
+modification automatically.
+
+### VLEN Configuration Matrix
+
+| Target VLEN | CMake march suffix | QEMU flag | ELF attribute | Dispatch case |
+|-------------|-------------------|-----------|---------------|---------------|
+| 128 | (default, no suffix) | `-cpu max` | `zvl128b` | `case 128` |
+| 256 | `_zvl256b` | `-cpu max,vlen=256` | `zvl256b` | `case 256` |
+| 512 | `_zvl512b` | `-cpu max,vlen=512` | `zvl512b` | `case 512` |
+| 1024 | `_zvl1024b` | `-cpu max,vlen=1024` | `zvl1024b` | `case 1024` |
+
+**Warning**: A binary compiled with `zvl256b` requires VLEN ≥ 256 at runtime.
+Running on VLEN=128 hardware (or QEMU without `vlen=256`) may produce:
+- `Illegal instruction` (vector ops exceed hardware VLEN)
+- Silent incorrect results (partial vector initialization)
+
+### BBV Profiling with VLEN=256 GEMV
+
+To profile the `ggml_gemv_q4_0_16x1_q8_0` function with BBV plugin:
+
+```bash
+# 1. Get function offset from nm (after zvl256b rebuild)
+nm -D -S output/llama.cpp/lib/libggml-cpu.so.0 | grep gemv_q4_0_16x1_q8_0
+# Example output: 00000000000aa7d8 000000000000030a T ggml_gemv_q4_0_16x1_q8_0
+
+# 2. Run QEMU with BBV plugin targeting the function
+qemu-riscv64 -L sysroot \
+  -E LD_LIBRARY_PATH=output/llama.cpp/lib \
+  -cpu max,vlen=256 \
+  -plugin tools/bbv/libbbv.so,lib_name=libggml-cpu,func_offset=0xaa7d8,func_size=0x30a,interval=1000,outfile=output/gemv-profile \
+  output/llama.cpp/bin/llama-completion \
+  -m models/Qwen2.5-0.5B-Instruct-Q4_0.gguf \
+  -p "Hello" -n 10
+```
+
+Expected BBV output verification:
+
+```bash
+# Check disas header shows correct function range
+head -5 output/gemv-profile.disas
+# Should show: Function: offset 0xaa7d8, size 0x30a, Range: <base> - <end>
+
+# Check BB data is non-empty
+wc -l output/gemv-profile.0.bb
+# Should show thousands of lines (function was called)
+```
+
 ## References
 
 - [llama.cpp RISC-V documentation](https://github.com/ggerganov/llama.cpp/blob/master/docs/build-riscv64-spacemit.md)

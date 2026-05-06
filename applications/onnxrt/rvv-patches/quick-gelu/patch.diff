@@ -1,0 +1,35 @@
+diff --git a/onnxruntime/contrib_ops/cpu/activations.h b/onnxruntime/contrib_ops/cpu/activations.h
+--- a/onnxruntime/contrib_ops/cpu/activations.h
++++ b/onnxruntime/contrib_ops/cpu/activations.h
+@@ -12,6 +12,10 @@
+ #include "core/util/math_cpuonly.h"
+ #include "core/mlas/inc/mlas.h"
+
++// RVV implementation: single source of truth is rvv_quick_gelu.inl
++// (copied to this directory by build.sh before patch is applied)
++#include "rvv_quick_gelu.inl"
++
+ #include "core/platform/threadpool.h"
+ #include <unsupported/Eigen/SpecialFunctions>
+ #include "core/providers/cpu/element_wise_ranged_transform.h"
+@@ -83,11 +87,15 @@ class QuickGelu : public OpKernel {
+
+           if (alpha_ != 1.0f) {
+-            // TODO: Consider vectorizing this scalar multiplication.
+-            // It needs exposing a new API in MLAS to take in a scalar
+-            // that will be used in the elementwise multiplication.
+-            // Estimate the cost-benefit tradeoff before proceeding
+-            // with that optimization.
++#if defined(__riscv_v_intrinsic)
++            QuickGeluAlphaScale_rvv(p_input, p_output, count, alpha_);
++            MlasComputeLogistic(p_output, p_output, onnxruntime::narrow<size_t>(count));
++#else
+             for (int64_t i = 0; i < count; i++) {
+               p_output[i] = p_input[i] * alpha_;
+             }
+-
+             MlasComputeLogistic(p_output, p_output, onnxruntime::narrow<size_t>(count));
++#endif
+           } else {
+             // SILU activation - this needs no `alpha_` scaling as `alpha_` will be 1.0f
+             MlasComputeLogistic(p_input, p_output, onnxruntime::narrow<size_t>(count));

@@ -1,0 +1,26 @@
+diff --git a/onnxruntime/core/mlas/lib/eltwise.cpp b/onnxruntime/core/mlas/lib/eltwise.cpp
+--- a/onnxruntime/core/mlas/lib/eltwise.cpp
++++ b/onnxruntime/core/mlas/lib/eltwise.cpp
+@@ -20,6 +20,10 @@ Abstract:
+
+ #include "mlasi.h"
+ #include "eltwise.h"
++
++// RVV implementation: single source of truth is rvv_eltwise_mul.inl
++// (copied to this directory by build.sh before patch is applied)
++#include "rvv_eltwise_mul.inl"
+
+ template <>
+ void
+@@ -59,6 +63,12 @@ MlasEltwiseMul<float>(
+     float* output,
+     size_t N
+ ) {
++#if defined(__riscv_v_intrinsic)
++    MlasEltwiseMulF32_rvv(left, right, output, N);
++    return;
++#endif
++
+     while (N > 0) {
+         if (N >= 4) {
+             MLAS_FLOAT32X4 LeftVec = MlasLoadFloat32x4(left);

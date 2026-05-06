@@ -1,0 +1,24 @@
+# started on Fri Apr 24 11:55:01 2026
+
+
+ Performance counter stats for '/root/yolo-perf/yolo_inference /root/yolo-perf/yolo11n.ort /root/yolo-perf/test.jpg 30':
+
+        171,661.02 msec task-clock                       #    1.000 CPUs utilized             
+               114      context-switches                 #    0.664 /sec                      
+                 0      cpu-migrations                   #    0.000 /sec                      
+            26,829      page-faults                      #  156.291 /sec                      
+   273,943,284,577      cycles                           #    1.596 GHz                         (12.50%)
+   236,494,408,140      instructions                     #    0.86  insn per cycle              (25.00%)
+     8,790,283,739      branches                         #   51.207 M/sec                       (37.50%)
+        43,763,216      branch-misses                    #    0.50% of all branches             (50.01%)
+    77,298,583,029      L1-dcache-loads                  #  450.298 M/sec                       (62.50%)
+       320,850,419      L1-dcache-load-misses            #    0.42% of all L1-dcache accesses   (75.00%)
+     <not counted>      LLC-loads                                                               (0.00%)
+     <not counted>      LLC-load-misses                                                         (0.00%)
+
+     171.671020282 seconds time elapsed
+
+     171.472276000 seconds user
+       0.187991000 seconds sys
+
+

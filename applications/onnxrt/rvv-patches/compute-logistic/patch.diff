@@ -1,0 +1,25 @@
+diff --git a/onnxruntime/core/mlas/lib/logistic.cpp b/onnxruntime/core/mlas/lib/logistic.cpp
+--- a/onnxruntime/core/mlas/lib/logistic.cpp
++++ b/onnxruntime/core/mlas/lib/logistic.cpp
+@@ -23,6 +23,10 @@ Abstract:
+
+ #include "mlasi.h"
+
++// RVV implementation: single source of truth is rvv_compute_logistic.inl
++// (copied to this directory by build.sh before patch is applied)
++#include "rvv_compute_logistic.inl"
++
+ //
+ // Bundles the floating point constants for use by kernels written in assembly.
+ //
+@@ -180,7 +184,12 @@ Return Value:
+
+ {
+ #if defined(MLAS_TARGET_AMD64) || defined(MLAS_USE_SVE)
+     GetMlasPlatform().LogisticKernelRoutine(Input, Output, N);
++#elif defined(__riscv_v_intrinsic)
++    MlasLogisticKernel_rvv(Input, Output, N);
+ #else
+     MlasLogisticKernel(Input, Output, N);
+ #endif
+ }

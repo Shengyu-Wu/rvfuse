@@ -1,0 +1,12 @@
+diff --git a/onnxruntime/core/mlas/lib/<target>.cpp b/onnxruntime/core/mlas/lib/<target>.cpp
+index <base-hash>..<result-hash> <mode>
+--- a/onnxruntime/core/mlas/lib/<target>.cpp
++++ b/onnxruntime/core/mlas/lib/<target>.cpp
+@@ -<line-number>,6 +<line-number>,10 @@
+
+ <context: existing code>
+
++// RVV implementation: single source of truth is rvv_<name>.inl
++#include "rvv_<name>.inl"
++
+ <context: surrounding code>

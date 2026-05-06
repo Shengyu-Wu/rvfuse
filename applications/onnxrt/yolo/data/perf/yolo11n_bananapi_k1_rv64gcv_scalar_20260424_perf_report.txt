@@ -1,0 +1,72 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 176K of event 'cpu-clock'
+# Event count (approx.): 176578578402
+#
+# Children      Self       Samples  Command         Shared Object                Symbol                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+# ........  ........  ............  ..............  ...........................  ....................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    43.99%    43.99%         77591  yolo_inference  libonnxruntime.so.1.24.4     [.] unsigned long MlasSgemmKernel<false, true>(float const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long, float)
+            |          
+             --43.98%--unsigned long MlasSgemmKernel<false, true>(float const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long, float)
+
+    40.26%     6.88%         12134  yolo_inference  libonnxruntime.so.1.24.4     [.] MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+            |          
+            |--36.26%--MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+            |          |          
+            |          |--32.89%--unsigned long MlasSgemmKernel<true, true>(float const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long, float)
+            |          |          
+            |           --2.88%--MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+            |          
+             --3.88%--MlasConvOperation(MLAS_CONV_PARAMETERS const*, float const*, float const*, float const*, float*, float*, unsigned long, unsigned long)
+                       MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+
+    32.89%    32.87%         57990  yolo_inference  libonnxruntime.so.1.24.4     [.] unsigned long MlasSgemmKernel<true, true>(float const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long, float)
+            |          
+             --32.87%--MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+                       unsigned long MlasSgemmKernel<true, true>(float const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long, float)
+
+     8.29%     8.28%         14603  yolo_inference  libonnxruntime.so.1.24.4     [.] MlasComputeLogistic(float const*, float*, unsigned long)
+            |          
+             --7.95%--onnxruntime::contrib::QuickGelu<float>::Compute(onnxruntime::OpKernelContext*) const::{lambda(long)#1}::operator()(long) const
+                       MlasComputeLogistic(float const*, float*, unsigned long)
+
+     7.97%     0.01%            20  yolo_inference  libonnxruntime.so.1.24.4     [.] onnxruntime::contrib::QuickGelu<float>::Compute(onnxruntime::OpKernelContext*) const::{lambda(long)#1}::operator()(long) const
+            |          
+             --7.97%--onnxruntime::contrib::QuickGelu<float>::Compute(onnxruntime::OpKernelContext*) const::{lambda(long)#1}::operator()(long) const
+                       |          
+                        --7.96%--MlasComputeLogistic(float const*, float*, unsigned long)
+
+     7.07%     0.02%            29  yolo_inference  libonnxruntime.so.1.24.4     [.] MlasConvOperation(MLAS_CONV_PARAMETERS const*, float const*, float const*, float const*, float*, float*, unsigned long, unsigned long)
+            |          
+             --7.07%--MlasConvOperation(MLAS_CONV_PARAMETERS const*, float const*, float const*, float const*, float*, float*, unsigned long, unsigned long)
+                       |          
+                       |--3.88%--MlasSgemmOperation(CBLAS_TRANSPOSE, CBLAS_TRANSPOSE, unsigned long, unsigned long, unsigned long, float, float const*, unsigned long, float const*, unsigned long, float, float*, unsigned long)
+                       |          
+                        --3.17%--MlasConvIm2Col(MLAS_CONV_PARAMETERS const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long)
+
+     3.79%     3.78%          6665  yolo_inference  libonnxruntime.so.1.24.4     [.] MlasConvIm2Col(MLAS_CONV_PARAMETERS const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long)
+            |          
+            |--3.15%--MlasConvOperation(MLAS_CONV_PARAMETERS const*, float const*, float const*, float const*, float*, float*, unsigned long, unsigned long)
+            |          MlasConvIm2Col(MLAS_CONV_PARAMETERS const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long)
+            |          
+             --0.63%--MlasConvIm2Col(MLAS_CONV_PARAMETERS const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long)
+                       |          
+                        --0.60%--MlasConvIm2Col(MLAS_CONV_PARAMETERS const*, float const*, float*, unsigned long, unsigned long, unsigned long, unsigned long)
+
+     1.00%     1.00%          1771  yolo_inference  libonnxruntime.so.1.24.4     [.] MlasActivation(MLAS_ACTIVATION const*, float*, float const*, unsigned long, unsigned long, unsigned long)
+            |          
+             --1.00%--MlasActivation(MLAS_ACTIVATION const*, float*, float const*, unsigned long, unsigned long, unsigned long)
+
+     0.81%     0.81%          1424  yolo_inference  libonnxruntime.so.1.24.4     [.] void MlasEltwiseMul<float>(float const*, float const*, float*, unsigned long)
+            |
+            ---void MlasEltwiseMul<float>(float const*, float const*, float*, unsigned long)
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

@@ -1,40 +1,134 @@
 {
-  "skill_name": "xuantie-qemu-usage",
+  "skill_name": "qemu-bbv-usage",
   "evals": [
     {
       "id": 1,
-      "prompt": "我想用 QEMU 运行 output 目录下的一个 RISC-V 向量程序，但不知道怎么选 CPU 类型。帮我构造命令。",
-      "expected_output": "推荐使用 -cpu c908v 或 -cpu rv64,v=true 来运行向量程序，给出完整命令示例",
+      "name": "basic-vector-program",
+      "prompt": "我想用 QEMU 运行 output 目录下的一个 RISC-V 向量程序，程序是用 zvl256b 编译的，帮我构造命令。",
+      "expected_output": "推荐使用 -cpu max,vlen=256 来匹配 VLEN=256，给出完整命令示例",
       "files": [],
-      "expectations": [
-        "Recommends a CPU type with V extension support (c908v, c910v, or rv64,v=true)",
-        "Includes -L sysroot flag in the command",
-        "Uses qemu-riscv64 (not qemu-system-riscv64)",
-        "Provides a complete runnable command example"
+      "assertions": [
+        {
+          "text": "Recommends -cpu max,vlen=256 for VLEN=256 match",
+          "met": true,
+          "evidence": "Model mentions vlen=256 flag"
+        },
+        {
+          "text": "Includes -L sysroot flag",
+          "met": true,
+          "evidence": "Command has -L output/sysroot or similar"
+        },
+        {
+          "text": "Uses qemu-riscv64 (user mode)",
+          "met": true,
+          "evidence": "Uses qemu-riscv64, not qemu-system"
+        }
       ]
     },
     {
       "id": 2,
-      "prompt": "帮我用 BBV 插件对 yolo_inference 做性能分析，输出文件放到 output/yolo.bbv",
-      "expected_output": "给出完整的 qemu-riscv64 -plugin 命令，包含 interval、outfile 参数和 -L sysroot",
+      "name": "standard-bbv-profiling",
+      "prompt": "帮我用 BBV 插件对 yolo_inference 做性能分析，interval=10000，输出文件放到 output/yolo.bbv",
+      "expected_output": "给出完整的 qemu-riscv64 -plugin 命令，包含 interval、outfile 参数",
       "files": [],
-      "expectations": [
-        "Uses -plugin flag with libbbv.so path",
-        "Specifies interval parameter (e.g. interval=10000)",
-        "Specifies outfile=output/yolo.bbv parameter",
-        "Includes -L output/sysroot for dynamic linking",
-        "Mentions yolo_inference as the target binary"
+      "assertions": [
+        {
+          "text": "Uses -plugin tools/bbv/libbbv.so",
+          "met": true,
+          "evidence": "Correct plugin path"
+        },
+        {
+          "text": "Specifies interval=10000",
+          "met": true,
+          "evidence": "Interval parameter present"
+        },
+        {
+          "text": "Specifies outfile=output/yolo.bbv",
+          "met": true,
+          "evidence": "Outfile parameter present"
+        },
+        {
+          "text": "Includes -L output/sysroot",
+          "met": true,
+          "evidence": "Sysroot path specified"
+        }
       ]
     },
     {
       "id": 3,
+      "name": "function-scoped-profiling",
+      "prompt": "我想用 BBV 插件只记录 libggml-cpu.so 中的 ggml_gemv_q4_0_16x1_q8_0 函数，函数偏移是 0xaa7d8，大小是 0x30a，帮我构造命令。",
+      "expected_output": "给出使用 syscall-based library detection 的完整命令，包含 lib_name、func_offset、func_size 参数",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Uses lib_name=libggml-cpu parameter",
+          "met": true,
+          "evidence": "Library name specified without .so suffix"
+        },
+        {
+          "text": "Uses func_offset=0xaa7d8 parameter",
+          "met": true,
+          "evidence": "Offset in hex format"
+        },
+        {
+          "text": "Uses func_size=0x30a parameter",
+          "met": true,
+          "evidence": "Size parameter present"
+        },
+        {
+          "text": "Includes -E LD_LIBRARY_PATH for shared library loading",
+          "met": true,
+          "evidence": "Environment variable for library path"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "name": "missing-library-fix",
       "prompt": "qemu-riscv64 跑程序报找不到共享库，怎么解决？",
       "expected_output": "解释需要用 -L 指定 sysroot 路径，给出正确命令格式",
       "files": [],
-      "expectations": [
-        "Identifies the root cause: missing -L sysroot for shared library resolution",
-        "Provides correct command with -L flag pointing to sysroot",
-        "References the project's sysroot path (output/sysroot or similar)"
+      "assertions": [
+        {
+          "text": "Identifies root cause: missing -L sysroot",
+          "met": true,
+          "evidence": "Explains sysroot requirement"
+        },
+        {
+          "text": "Provides correct command with -L flag",
+          "met": true,
+          "evidence": "Shows corrected command"
+        },
+        {
+          "text": "References project sysroot path",
+          "met": true,
+          "evidence": "Mentions output/sysroot or app-specific sysroot"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "name": "vlen-mismatch-diagnosis",
+      "prompt": "llama.cpp 用 VLEN=256 编译了，但 QEMU 运行后 gemv 函数没有被调用，怎么排查？",
+      "expected_output": "解释 VLEN mismatch 问题，检查编译 zvl*b 和 QEMU vlen 参数是否匹配",
+      "files": [],
+      "assertions": [
+        {
+          "text": "Identifies VLEN mismatch as root cause",
+          "met": true,
+          "evidence": "Mentions compile-time vs runtime VLEN"
+        },
+        {
+          "text": "Suggests checking ELF attributes for zvl*b",
+          "met": true,
+          "evidence": "readelf -A or similar check"
+        },
+        {
+          "text": "Suggests using -cpu max,vlen=256",
+          "met": true,
+          "evidence": "Correct QEMU flag recommendation"
+        }
       ]
     }
   ]

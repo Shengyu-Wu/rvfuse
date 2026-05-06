@@ -1,0 +1,188 @@
+diff --git a/cmake/onnxruntime_mlas.cmake b/cmake/onnxruntime_mlas.cmake
+--- a/cmake/onnxruntime_mlas.cmake
++++ b/cmake/onnxruntime_mlas.cmake
+@@ -833,9 +833,13 @@ endif()
+     if(RISCV64 AND MLAS_SOURCE_IS_NOT_SET)
+         set(mlas_platform_srcs
++          ${MLAS_SRC_DIR}/riscv64/SgemmKernelRvv512.cpp
++          ${MLAS_SRC_DIR}/riscv64/SgemmPackB16.cpp
+           ${MLAS_SRC_DIR}/riscv64/SgemmKernelRvv.cpp
+           ${MLAS_SRC_DIR}/scalar/SgemmKernelScalar.cpp
+         )
++        # Define VLEN_512 for 512-bit vector register builds
++        add_compile_definitions(VLEN_512)
+         if(NOT ONNXRUNTIME_MLAS_MULTI_ARCH)
+           set(MLAS_SOURCE_IS_NOT_SET 0)
+         endif()
+diff --git a/onnxruntime/core/mlas/inc/mlas.h b/onnxruntime/core/mlas/inc/mlas.h
+--- a/onnxruntime/core/mlas/inc/mlas.h
++++ b/onnxruntime/core/mlas/inc/mlas.h
+@@ -83,6 +83,12 @@ Abstract:
+ #if defined(__riscv) && defined(__riscv_v)
+ #define MLAS_TARGET_RISCV
+ #endif
++
++// VLEN configuration for RVV kernels
++#if defined(VLEN_512)
++#define MLAS_RVV_VLEN_512
++#endif
++
+ //
+ // Define the support levels for the target architecture.
+ //
+diff --git a/onnxruntime/core/mlas/lib/mlasi.h b/onnxruntime/core/mlas/lib/mlasi.h
+--- a/onnxruntime/core/mlas/lib/mlasi.h
++++ b/onnxruntime/core/mlas/lib/mlasi.h
+@@ -476,6 +476,16 @@ typedef
+ void
+ (MLASCALL MLAS_SGEMM_TRANSPOSE_PACKB_BLOCK_ROUTINE)(
+     float* D,
+     const float* B,
+     size_t ldb
+     );
+
++typedef
++void
++(MLASCALL MLAS_SGEMM_PACKB16_KERNEL)(
++    float* D,
++    const float* B,
++    size_t ldb,
++    size_t CountX,
++    size_t CountY
++    );
++
+ typedef
+ size_t
+ (MLASCALL MLAS_GEMM_U8S8_KERNEL)(
+@@ -966,6 +976,8 @@ extern "C" {
+     MLAS_COMPUTE_LOGSOFTMAX_OUTPUT_FLOAT_KERNEL MlasComputeLogSoftmaxOutputF32KernelLasx;
+ #elif defined(MLAS_TARGET_RISCV)
+     MLAS_GEMM_FLOAT_KERNEL MlasSgemmKernelRvv;
++    MLAS_GEMM_FLOAT_KERNEL MlasSgemmKernelRvv512;
++    MLAS_SGEMM_PACKB16_KERNEL MlasSgemmPackB16;
+     MLAS_GEMM_FLOAT_KERNEL MlasSgemmKernelZero;
+     MLAS_GEMM_FLOAT_KERNEL MlasSgemmKernelAdd;
+ #else
+@@ -1382,6 +1394,7 @@ struct MLAS_PLATFORM {
+ #endif
+ #if defined(MLAS_TARGET_RISCV)
+     MLAS_GEMM_FLOAT_KERNEL* GemmFloatKernel;
++    MLAS_SGEMM_PACKB16_KERNEL* PackB16Kernel;
+ #endif
+ #if defined(MLAS_TARGET_AMD64_IX86)
+     const MLAS_GEMM_QUANT_DISPATCH* GemmU8S8Dispatch;
+diff --git a/onnxruntime/core/mlas/lib/platform.cpp b/onnxruntime/core/mlas/lib/platform.cpp
+--- a/onnxruntime/core/mlas/lib/platform.cpp
++++ b/onnxruntime/core/mlas/lib/platform.cpp
+@@ -795,9 +795,17 @@ Return Value:
+
+ #if defined(MLAS_TARGET_RISCV)
+
+     //
+     // Use the RVV GEMM kernel for float matrix multiplication.
++    // Select VL=16 kernel for 512-bit VLEN implementations.
+     //
+
++#if defined(MLAS_RVV_VLEN_512)
++    this->GemmFloatKernel = MlasSgemmKernelRvv512;
++    this->PackB16Kernel = MlasSgemmPackB16;
++#else
+     this->GemmFloatKernel = MlasSgemmKernelRvv;
++    this->PackB16Kernel = nullptr;
++#endif
+
+ #endif // MLAS_TARGET_RISCV
+
+diff --git a/onnxruntime/core/mlas/lib/sgemm.cpp b/onnxruntime/core/mlas/lib/sgemm.cpp
+--- a/onnxruntime/core/mlas/lib/sgemm.cpp
++++ b/onnxruntime/core/mlas/lib/sgemm.cpp
+@@ -1273,7 +1273,19 @@ Return Value:
+             //
+             // Copy or transpose a panel of matrix B to a local packed buffer.
+             //
+
++#if defined(MLAS_TARGET_RISCV) && defined(MLAS_RVV_VLEN_512)
++            //
++            // Use 16-column packing for VL=16 RVV kernel (512-bit VLEN).
++            // This matches the kernel's vector width for optimal memory access.
++            //
++            if (TransB == CblasNoTrans) {
++                MlasSgemmPackB16(PanelB, B + n + k * ldb, ldb, CountN, CountK);
++            } else {
++                MlasSgemmTransposePackB(PanelB, B + k + n * ldb, ldb, CountN, CountK);
++            }
++#else
+             if (TransB == CblasNoTrans) {
+                 MlasSgemmCopyPackB(PanelB, B + n + k * ldb, ldb, CountN, CountK);
+             } else {
+                 MlasSgemmTransposePackB(PanelB, B + k + n * ldb, ldb, CountN, CountK);
+             }
++#endif
+
+             //
+             // Step through each slice of matrix A along the M dimension.
+diff --git a/onnxruntime/core/mlas/lib/riscv64/SgemmKernelRvv512.cpp b/onnxruntime/core/mlas/lib/riscv64/SgemmKernelRvv512.cpp
+new file mode 100644
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/riscv64/SgemmKernelRvv512.cpp
+@@ -0,0 +1,33 @@
++/*++
++
++Copyright (c) RVFuse Project. All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    SgemmKernelRvv512.cpp
++
++Abstract:
++
++    This module implements the RVV (RISC-V Vector Extension) kernel for the
++    single precision matrix/matrix multiply operation (SGEMM) targeting
++    512-bit vector registers (VLEN=512, SEW=32, LMUL=1, VL=16).
++
++    The implementation is in rvv_sgemm_kernel_vl16.inl (single source of truth),
++    shared with the standalone correctness test.
++
++    This kernel processes 16 columns per vector instruction, using 16-column
++    B packing for optimal memory access patterns.
++
++--*/
++
++#include "mlasi.h"
++
++#include "rvv_sgemm_kernel_vl16.inl"
+diff --git a/onnxruntime/core/mlas/lib/riscv64/SgemmPackB16.cpp b/onnxruntime/core/mlas/lib/riscv64/SgemmPackB16.cpp
+new file mode 100644
+--- /dev/null
++++ b/onnxruntime/core/mlas/lib/riscv64/SgemmPackB16.cpp
+@@ -0,0 +1,30 @@
++/*++
++
++Copyright (c) RVFuse Project. All rights reserved.
++
++Licensed under the MIT License.
++
++Module Name:
++
++    SgemmPackB16.cpp
++
++Abstract:
++
++    This module implements the B matrix packing function for 16-column blocks,
++    optimized for the VL=16 RVV GEMM kernel (VLEN=512, SEW=32, LMUL=1).
++
++    The implementation is in rvv_sgemm_pack_b16.inl (single source of truth),
++    shared with the standalone correctness test.
++
++    Layout: For each 16-column block, rows are packed contiguously:
++    D[0..15]  = B_row_0[col0..col15]
++    D[16..31] = B_row_1[col0..col15]
++    ...
++
++--*/
++
++#include "mlasi.h"
++
++#include "rvv_sgemm_pack_b16.inl"

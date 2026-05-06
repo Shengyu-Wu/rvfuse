@@ -4,406 +4,247 @@ description: |
   How to use QEMU (qemu-riscv64) with the custom BBV plugin for RISC-V program profiling
   within the RVFuse project. Use this skill whenever the user mentions running QEMU,
   qemu-riscv64, BBV profiling, RISC-V emulation, QEMU plugins, sysroot, running RISC-V binaries,
-  QEMU CPU selection, vector extension programs, or QEMU debugging options — even if they don't
-  explicitly ask for "QEMU help."
+  QEMU CPU selection, vector extension programs, function-scoped recording, VLEN configuration,
+  gemv profiling, library detection, or any RISC-V performance analysis — even if they don't
+  explicitly ask for "QEMU help" or "BBV profiling."
 ---
 
-# QEMU + BBV Plugin Usage Guide (RVFuse Project)
+# QEMU + BBV Plugin Usage Guide
 
 This skill covers **runtime usage** of QEMU with the custom BBV (Basic Block Vector) plugin.
-For building QEMU and the plugin, see `verify_bbv.sh`.
+For plugin implementation details, see `references/implementation.md`.
+For hotspot analysis best practices, see `references/analysis-guide.md`.
 
 ## Key Paths
 
 | Item | Path |
 |------|------|
 | QEMU binary | `third_party/qemu/build/qemu-riscv64` |
-| Custom BBV plugin | `tools/bbv/libbbv.so` |
-| Sysroot | `output/sysroot` (RISC-V shared libraries) |
-| ELF binary | e.g. `output/yolo_inference` |
+| BBV plugin | `tools/bbv/libbbv.so` |
+| Sysroot | `output/sysroot` or application-specific |
 | BBV output | `outfile.<vcpu_index>.bb` + `outfile.disas` |
 
-## BBV Plugin Overview
+## BBV Plugin Features
 
-The BBV plugin generates basic block execution counts for hotspot analysis. This is a **custom implementation** located in `tools/bbv/` with these features:
+- **Standard mode**: Profile entire program execution
+- **Function-scoped mode**: NEW — Profile only specific target function
+- **Syscall-based detection**: Automatically find shared library load addresses
+- **Per-vCPU output**: Multi-threaded program support
 
-- **Dual output**: Both `.bb` (execution counts) and `.disas` (disassembly) are generated
-- **Exit flush**: Data is flushed at program exit, ensuring complete coverage
-- **Per-vCPU tracking**: Supports multi-threaded programs with per-thread BBV data
-
-### Source Files
-
-| File | Purpose |
-|------|---------|
-| `tools/bbv/bbv.c` | Main plugin implementation |
-| `tools/bbv/Makefile` | Build configuration |
-| `tools/bbv/demo.c` | Test program for verification |
-
-## Running RISC-V Programs (User Mode)
-
-Basic execution requires a sysroot for dynamic linking:
+## Running RISC-V Programs
 
 ```bash
 qemu-riscv64 -L output/sysroot ./your_program [args...]
 ```
 
-### CPU Selection (`-cpu`)
+### CPU and VLEN Selection
+
+**Critical for vector programs**: Match QEMU VLEN to compile-time `zvl*b` extension.
+
+| Compile VLEN | QEMU Flag | Mismatch Result |
+|--------------|-----------|-----------------|
+| `zvl128b` (default) | `-cpu max` | OK |
+| `zvl256b` | `-cpu max,vlen=256` | Illegal instruction or silent errors |
+| `zvl512b` | `-cpu max,vlen=512` | Illegal instruction or silent errors |
 
 ```bash
-# Generic RV64 with specific extensions enabled
-qemu-riscv64 -cpu rv64,v=true -L output/sysroot ./your_vec_program
+# Enable V extension with specific VLEN
+qemu-riscv64 -cpu max,vlen=256 -L output/sysroot ./vlen256_program
 
-# List all available CPU types
-qemu-riscv64 -cpu help
+# Verify VLEN in program output
+# Look for: RVV_VLEN = 32 (means 32 bytes = 256 bits)
 ```
 
-### Debugging Flags (`-d`)
+### Debugging Flags
 
 ```bash
-# System call trace
-qemu-riscv64 -d strace -L output/sysroot ./program
-
-# CPU register state before each translation block
-qemu-riscv64 -d cpu -L output/sysroot ./program
-
-# Log unimplemented instructions
-qemu-riscv64 -d unimp -L output/sysroot ./program
-```
-
-### GDB Remote Debugging
-
-```bash
-# Terminal 1: Start QEMU waiting for GDB
-qemu-riscv64 -g 1234 -L output/sysroot ./program
-
-# Terminal 2: Connect with GDB
-riscv64-unknown-elf-gdb -ex "target remote localhost:1234" ./program
+qemu-riscv64 -d strace -L output/sysroot ./program   # Syscall trace
+qemu-riscv64 -d cpu -L output/sysroot ./program      # Register state
+qemu-riscv64 -g 1234 -L output/sysroot ./program     # GDB remote debug
 ```
 
 ## BBV Plugin Usage
 
-### Basic Command
+### Standard Recording (Full-Program)
 
 ```bash
 qemu-riscv64 -L output/sysroot \
-  -plugin tools/bbv/libbbv.so,interval=10000,outfile=output/yolo.bbv \
-  ./output/yolo_inference ./output/yolo11n.ort ./output/test.jpg
+  -plugin tools/bbv/libbbv.so,interval=10000,outfile=output/profile \
+  ./your_program [args...]
 ```
 
-### Plugin Parameters
-
+**Parameters**:
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `outfile` | **Yes** | - | Output file prefix (must be specified) |
-| `interval` | No | 100000000 | Instructions per BBV sampling interval |
+| `outfile` | **Yes** | - | Output file prefix |
+| `interval` | No | 100000000 | Instructions per sampling interval |
 
-**Note**: `outfile` is **required** — the plugin fails if not specified.
+### Function-Scoped Recording (Recommended for Libraries)
+
+Profile only a specific function within a shared library — much faster than full-program profiling.
+
+#### Step 1: Get function offset from nm
+
+```bash
+nm -D -S output/llama.cpp/lib/libggml-cpu.so.0 | grep <function_name>
+# Output: 00000000000aa7d8 000000000000030a T ggml_gemv_q4_0_16x1_q8_0
+#         ^offset                           ^size
+```
+
+#### Step 2: Run with library detection
+
+```bash
+qemu-riscv64 -L sysroot -E LD_LIBRARY_PATH=lib -cpu max,vlen=256 \
+  -plugin tools/bbv/libbbv.so,lib_name=libggml-cpu,func_offset=0xaa7d8,func_size=0x30a,interval=1000,outfile=output/gemv \
+  ./llama-completion -m model.gguf -p "Hello" -n 20
+```
+
+**How it works**: Plugin intercepts `openat`/`mmap` syscalls to detect library loading,
+then calculates function address and filters BB recording to that range only.
+
+#### Function-Scoped Parameters
+
+| Parameter | Format | Description |
+|-----------|--------|-------------|
+| `lib_name` | `libggml-cpu` | Library name (no `.so` suffix) — **requires** `func_offset` |
+| `func_offset` | `0xaa7d8` | Static offset from nm (hex) |
+| `func_size` | `0x30a` | Function size (hex or decimal) |
+| `func_name` | `my_func` | Symbol name (main program only, not shared libs) |
+| `func_addr` | `140737...` | Direct runtime address (decimal, requires ASLR off) |
+
+#### Detection Methods Comparison
+
+| Method | Use Case | Requires ASLR off | Setup |
+|--------|----------|-------------------|-------|
+| `lib_name` + `func_offset` | Shared libraries | No | nm offset |
+| `func_name` | Main program symbols | No | Symbol name |
+| `func_addr` | Known runtime address | Yes | Direct address |
 
 ### Output Files
 
-The plugin generates two files:
-
-1. **`outfile.<vcpu_index>.bb`** — Basic block execution counts
-   - Format: `T:index:count` per line (one line per interval)
-   - Example: `T:0:1000 1:500 2:250` means BB#0 executed 1000 times, BB#1 500 times
-
-2. **`outfile.disas`** — Disassembly of all encountered basic blocks
-   - Format per block:
-     ```
-     BB <index> (vaddr: 0x<vaddr>, <n> insns):
-       0x<addr>: <disassembly>
-       ...
-     ```
-
-### Choosing the Interval
-
-| Interval | Granularity | Output Size | Use Case |
-|----------|-------------|-------------|----------|
-| 1000-10000 | Fine | Large | Short programs, detailed analysis |
-| 10000-100000 | Medium | Moderate | Typical profiling (YOLO inference) |
-| 100000+ | Coarse | Small | Long-running programs |
-
-### Interval Behavior (from bbv.c)
-
-The plugin counts instructions and triggers output when count reaches `interval`:
-
-```c
-// After each translation block execution:
-qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-    tb, QEMU_PLUGIN_INLINE_ADD_U64, count_u64(), n_insns);
-
-// When count >= interval, flush and reset:
-qemu_plugin_register_vcpu_tb_exec_cond_cb(
-    tb, vcpu_interval_exec, QEMU_PLUGIN_CB_NO_REGS,
-    QEMU_PLUGIN_COND_GE, count_u64(), interval, NULL);
+**`.bb` file** — BBV execution counts (SimPoint format):
+```
+T:0:1000 1:500 2:250 ...
 ```
 
-At program exit, `plugin_flush()` writes any remaining counts.
+**`.disas` file** — Disassembly of recorded BBs:
+```
+# BBV Function-Scoped Mode (Syscall-Based)
+# Library: libggml-cpu (base 0x7ffff62b9000)
+# Function: offset 0xaa7d8, size 0x30a
+# Range: 0x7ffff63637d8 - 0x7ffff6363ae2
 
-## Building the Custom BBV Plugin
+BB 0 (vaddr: 0x7ffff63637d8, 2 insns):
+  0x7ffff63637d8: addi a2,zero,16
+  ...
+```
+
+### Interval Selection
+
+| Interval | Granularity | Use Case |
+|----------|-------------|----------|
+| 1000-10000 | Fine | Function-scoped, short programs |
+| 10000-100000 | Medium | Standard profiling |
+| 100000+ | Coarse | Long-running programs |
+
+## VLEN Configuration Example
+
+For llama.cpp GEMV profiling (VLEN=256 kernel):
 
 ```bash
-# Build the custom plugin (requires QEMU headers from submodule)
-make -C tools/bbv/
+# 1. Verify binary has zvl256b
+readelf -A output/llama.cpp/lib/libggml-cpu.so.0 | grep zvl256b
+# Should show: zvl256b1p0
 
-# Output: tools/bbv/libbbv.so
+# 2. Get function offset
+nm -D -S output/llama.cpp/lib/libggml-cpu.so.0 | grep gemv_q4_0_16x1_q8_0
+
+# 3. Run with matching VLEN
+qemu-riscv64 -L output/llama.cpp/sysroot \
+  -E LD_LIBRARY_PATH=output/llama.cpp/lib \
+  -cpu max,vlen=256 \
+  -plugin tools/bbv/libbbv.so,lib_name=libggml-cpu,func_offset=0xaa7d8,func_size=0x30a,interval=1000,outfile=output/gemv \
+  output/llama.cpp/bin/llama-completion \
+  -m models/Qwen2.5-0.5B-Instruct-Q4_0.gguf -p "Hello" -n 10
 ```
 
-Requirements:
-- `gcc` with `-shared -fPIC` support
-- `glib-2.0` development package
-- QEMU headers at `third_party/qemu/include/qemu/qemu-plugin.h`
-
-## Verification
-
-Run the verification script to build QEMU and test the BBV plugin:
-
-```bash
-# Build and verify (first time)
-./verify_bbv.sh
-
-# Force rebuild
-./verify_bbv.sh --force-rebuild
-```
-
-The script:
-1. Compiles a demo test program (`tools/bbv/demo.c`)
-2. Builds QEMU with plugin support
-3. Builds the custom BBV plugin
-4. Runs the demo with BBV profiling
-5. Validates output file generation
+See `applications/llama.cpp/README.md` section "GEMV Kernel Dispatch and VLEN Configuration"
+for compile-time setup.
 
 ## BBV Output Analysis
 
-After BBV profiling, analyze the output with `tools/analyze_bbv.py`:
-
 ```bash
-# Generate hotspot report
 python3 tools/analyze_bbv.py \
-  --bbv output/yolo.bbv.0.bb \
-  --elf output/yolo_inference \
+  --bbv output/profile.0.bb \
+  --elf output/your_program \
   --sysroot output/sysroot \
   --top 20 \
-  --json-output output/hotspot.json \
   -o output/hotspot-report.txt
 ```
 
-This resolves basic block addresses to source locations (function names) using addr2line, producing a ranked hotspot report. See **Hotspot Analysis Best Practices** below for correct usage.
+**Important**: Use the correct sysroot for your application:
+- llama.cpp → `output/llama.cpp/sysroot`
+- ONNX Runtime → `output/sysroot`
 
-## Hotspot Analysis Best Practices
+For detailed analysis best practices, see `references/analysis-guide.md`.
 
-### Correct Sysroot Path
+## Troubleshooting
 
-**Critical**: The sysroot path must contain all shared libraries used by the profiled binary. Using an incorrect sysroot leads to misidentification of hotspots.
-
-```bash
-# Example: llama.cpp has its own sysroot with libllama.so, libggml*.so
-python3 tools/analyze_bbv.py \
-  --bbv output/llama.bbv.0.bb \
-  --elf output/llama.cpp/bin/llama-cli \
-  --sysroot output/llama.cpp/sysroot   # NOT output/sysroot!
-```
-
-**Verification**: Check that application-specific libraries exist in the sysroot:
-```bash
-# For llama.cpp
-ls output/llama.cpp/sysroot/lib/riscv64-linux-gnu/libllama*.so
-ls output/llama.cpp/sysroot/lib/riscv64-linux-gnu/libggml*.so
-
-# For ONNX Runtime
-ls output/sysroot/lib/riscv64-linux-gnu/libonnx*.so
-```
-
-### PIE Executable Address Resolution
-
-Modern binaries are often PIE (Position Independent Executable). Runtime addresses differ from static file offsets, requiring base address detection.
-
-The `analyze_bbv.py` script handles this automatically:
-- Detects PIE executables via `file` command output
-- Analyzes address distribution to estimate runtime base
-- Converts runtime addresses to file offsets for addr2line
-
-**Manual verification** (if needed):
-```bash
-# Check if binary is PIE
-file output/llama.cpp/bin/llama-cli
-# Should show: "DYN ... PIE executable"
-
-# Estimated PIE base appears in stderr during analysis
-python3 tools/analyze_bbv.py --bbv ... 2>&1 | grep -i "pie"
-```
-
-### Application Library Matching Priority
-
-The analysis prioritizes application-specific libraries (llama, ggml, onnx, ort) over system libraries (libc, libcrypto). This prevents hotspots being incorrectly attributed to system libraries.
-
-**Common misidentification patterns** (before fix):
-- libcrypto.so showing 80%+ of execution (incorrect)
-- libgnutls.so showing most hotspots (incorrect)
-
-**Expected patterns** (after proper analysis):
-- libllama.so showing majority of inference hotspots
-- libggml-cpu.so showing quantization/computation hotspots
-- libonnxruntime.so showing ML inference hotspots
-
-### Verifying Analysis Results
-
-#### 1. Library Distribution Check
-
-```bash
-python3 -c "
-import json
-with open('output/hotspot.json') as f:
-    data = json.load(f)
-libs = {}
-for b in data['blocks']:
-    loc = b['location']
-    if '[' in loc:
-        lib = loc.split('[')[1].split(']')[0]
-        libs[lib] = libs.get(lib, 0) + b['count']
-total = sum(libs.values())
-for lib, cnt in sorted(libs.items(), key=lambda x: -x[1])[:5]:
-    print(f'{lib}: {cnt/total*100:.2f}%')
-"
-```
-
-**Expected**: Application libraries (libllama, libggml, libonnx) should dominate, not system libraries.
-
-#### 2. Symbol Resolution Check
-
-Hotspots should show meaningful function names, not `??`:
-
-```bash
-# Check top 10 hotspots for symbol quality
-head -20 output/hotspot-report.txt | grep -E "^\s*[0-9]+"
-```
-
-**Good result**: `[libggml-cpu.so] ggml_quantize_mat_q8_0_4x4`
-**Bad result**: `[libcrypto.so.3] ?? (??:0)` (wrong library + no symbol)
-
-#### 3. Address-to-Library Mapping Verification
-
-For suspicious hotspot addresses, manually verify which library they belong to:
-
-```bash
-# Check if address 0x7f290b083500 belongs to libggml-cpu.so
-addr=0x7f290b083500
-base=0x7f290b04f000  # Estimated from analysis
-offset=$((addr - base))
-addr2line -f -e output/llama.cpp/sysroot/lib/riscv64-linux-gnu/libggml-cpu.so.0.9.11 $offset
-```
-
-If this gives a valid symbol, but the report shows libcrypto.so, the analysis has a matching error.
-
-### Common Issues and Solutions
+### Quick Reference
 
 | Issue | Symptom | Solution |
 |-------|---------|----------|
-| Wrong sysroot | Hotspots in system libraries | Use application-specific sysroot |
-| Missing .so files | `<unknown-so>@0x...` labels | Add libraries to sysroot |
-| Stripped libraries | `??` for all symbols | Use debug builds or accept symbol unknowns |
-| PIE not detected | Main binary addresses unmatched | Check `file` output shows "PIE" |
-| Library overlap | Multiple libraries matched | Analysis uses symbol validation bonus |
+| Missing libraries | "No such file" | Use correct `-L sysroot` |
+| Missing outfile | "outfile unspecified" | Add `outfile=output/test` |
+| Parameter format error | "option parsing failed" | No spaces, comma-separated |
+| Missing func_offset | "func_offset required" | Pair `lib_name` with `func_offset` |
+| Empty function output | 0 BBs | Verify function called, check nm offset |
+| VLEN mismatch | Kernel not dispatched | Match QEMU vlen to compile zvl*b |
+| Wrong sysroot | Hotspots in system libs | Use app-specific sysroot |
+| PIE addresses | Main binary unmatched | Script auto-detects PIE |
+| Stripped libs | `??` symbols | Use `nm -D` for dynamic symbols |
 
-### Analysis Algorithm Details
-
-The `analyze_bbv.py` script uses these techniques for accurate matching:
-
-1. **PIE base detection**: Analyzes low-address cluster (0x55* region) to estimate base
-2. **Application library priority**: Processes llama/ggml/onnx libs before libc/libcrypto
-3. **Execution count weighting**: Weights candidate bases by total execution count, not address count
-4. **Symbol validation bonus**: Uses addr2line to verify symbols, giving 50% bonus to correct library
-
-### Stripped Binary Handling
-
-Most RISC-V libraries are stripped (no debug symbols). The analysis still works because:
-- Dynamic symbol table (`nm -D`) provides function names
-- Library matching uses LOAD segment address ranges
-- Hotspots are attributed to correct libraries even without file/line info
+### Common Fixes
 
 ```bash
-# Check if library is stripped
-file output/llama.cpp/sysroot/lib/riscv64-linux-gnu/libllama.so.0.0.1
-# Shows: "stripped" - but nm -D still shows exported symbols
+# Wrong: spaces in parameters
+-plugin libbbv.so,lib_name = libggml-cpu
 
-nm -D output/llama.cpp/sysroot/lib/riscv64-linux-gnu/libllama.so.0.0.1 | head
+# Correct: no spaces
+-plugin libbbv.so,lib_name=libggml-cpu,func_offset=0xaa7d8
+
+# Verify binary VLEN requirement
+readelf -A lib/libggml-cpu.so.0 | grep zvl
+
+# Verify function exists and check offset
+nm -D -S lib/libggml-cpu.so.0 | grep <function>
 ```
 
-## Running Vector (V Extension) Programs
+### Function Not Called
+
+If function-scoped output is empty:
+1. Verify function name in nm output (may have changed after rebuild)
+2. Check program actually uses that code path (e.g., VLEN dispatch)
+3. For llama.cpp GEMV: ensure `-DGGML_RV_ZVL256B=ON` was used in build
+
+## Reference Files
+
+| File | Content |
+|------|---------|
+| `references/implementation.md` | Plugin data structures, callbacks, syscall flow |
+| `references/analysis-guide.md` | Hotspot analysis best practices |
+| `tools/bbv/README.md` | Plugin build instructions |
+
+## Building the Plugin
 
 ```bash
-# Enable V extension explicitly
-qemu-riscv64 -cpu rv64,v=true -L output/sysroot ./vec_program
-
-# With BBV profiling
-qemu-riscv64 -cpu rv64,v=true -L output/sysroot \
-  -plugin tools/bbv/libbbv.so,interval=10000,outfile=output/vec.bbv \
-  ./vec_program [args...]
+make -C tools/bbv/
+./verify_bbv.sh  # Build + test
 ```
 
-## Common Patterns & Troubleshooting
+## Limitations
 
-### "No such file" for shared libraries
-
-Ensure `-L` points to the correct sysroot:
-
-```bash
-qemu-riscv64 -L output/sysroot ./program  # NOT just ./program
-```
-
-### "outfile unspecified" error
-
-The custom BBV plugin requires `outfile` parameter:
-
-```bash
-# Wrong: missing outfile
-qemu-riscv64 -plugin tools/bbv/libbbv.so,interval=10000 ./program
-
-# Correct:
-qemu-riscv64 -plugin tools/bbv/libbbv.so,interval=10000,outfile=output/test ./program
-```
-
-### BBV output not generated
-
-- Check plugin path: `tools/bbv/libbbv.so` (not upstream path)
-- Verify plugin was built: `make -C tools/bbv/`
-- Run `./verify_bbv.sh` to validate the setup
-
-### Performance is slow
-
-- Use larger `interval` values to reduce output frequency
-- Without profiling, omit `-plugin` for faster execution
-- QEMU is for analysis, not benchmarking absolute performance
-
-### Check if a binary is RISC-V
-
-```bash
-file ./output/yolo_inference
-# Should show: ELF 64-bit LSB executable, UCB RISC-V, ...
-```
-
-## Plugin Implementation Details
-
-### Data Structures (from bbv.c)
-
-```c
-typedef struct Bb {
-    uint64_t vaddr;              // Basic block virtual address
-    struct qemu_plugin_scoreboard *count;  // Per-vCPU execution count
-    unsigned int index;          // BB index for output
-} Bb;
-
-typedef struct Vcpu {
-    uint64_t count;              // Instruction counter for interval
-    FILE *file;                  // Output file handle
-} Vcpu;
-```
-
-### Key Callbacks
-
-| Callback | Purpose |
-|----------|---------|
-| `vcpu_init` | Open per-vCPU output file |
-| `vcpu_tb_trans` | Register new BB, record disassembly |
-| `vcpu_interval_exec` | Flush counts when interval reached |
-| `plugin_exit` | Final flush and cleanup |
+- `func_name` only works for main program symbols (not shared library symbols)
+- `lib_name` requires target function to actually execute during the run
+- `func_addr` requires ASLR disabled (`setarch x86_64 -R`)
+- Syscall numbers (openat=56, mmap=222) are RISC-V specific

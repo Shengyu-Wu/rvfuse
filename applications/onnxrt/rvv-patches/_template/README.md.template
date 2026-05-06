@@ -1,0 +1,49 @@
+# <name>
+
+RVV implementation of `<function_name>` - <brief description>.
+
+## Status
+
+✅ / ⚠️ / 🔴 — <status description>
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `rvv_<name>.inl` | RVV implementation (single source of truth) |
+| `patch.diff` | Patch to integrate into ONNX Runtime MLAS |
+| `test.cpp` | Correctness test (RVV vs scalar reference) |
+
+## Function Signature
+
+```cpp
+<function_signature>
+```
+
+## Algorithm
+
+1. <Step 1>
+2. <Step 2>
+...
+
+## VLEN Requirement
+
+- **VLEN >= <threshold>**: Uses RVV intrinsics
+- **VLEN < <threshold>**: Falls back to scalar
+
+## Build & Test
+
+```bash
+# Build standalone test (rv64gcv, VLEN=256)
+riscv64-unknown-linux-gnu-clang++ -std=c++17 -O2 \
+    --target=riscv64-unknown-linux-gnu --sysroot=<sysroot> \
+    -march=rv64gcv_zvl256b -mabi=lp64d \
+    -D__riscv_v_intrinsic \
+    test.cpp -o test -lm
+
+# Run under QEMU
+qemu-riscv64 -cpu rv64,v=true,vlen=256 -L <sysroot> ./test
+
+# Scalar build (for reference)
+g++ -std=c++17 -O2 test.cpp -o test_scalar -lm
+```
