@@ -68,56 +68,13 @@ run_qemu_test() {
 }
 
 # --- Banana Pi perf profiling ---
+# Use the perf-profiling skill instead of a dedicated script.
+# Example: ask Claude to run perf profiling with:
+#   "在香蕉派上对 ResNet50 做 perf profiling，IP=${RVFUSE_HOST}"
 run_perf_profile() {
-    info "Running perf profiling on Banana Pi..."
-
-    # Check if host is provided
-    if [ -z "${RVFUSE_HOST:-}" ]; then
-        error "RVFUSE_HOST environment variable not set. Example: RVFUSE_HOST=192.168.1.22"
-    fi
-
-    # Password from environment or default
-    RVFUSE_PASSWORD="${RVFUSE_PASSWORD:-bianbu}"
-
-    # Run perf profiling script
-    python3 "${PROJECT_ROOT}/tools/perf_scalar_profile.py" \
-        --host "${RVFUSE_HOST}" \
-        --user root \
-        --password "${RVFUSE_PASSWORD}" \
-        --remote-dir "/root/resnet50-perf" \
-        --runner "${OUTPUT_DIR}/generic_ort_runner" \
-        --rootfs "${OUTPUT_DIR}/rootfs.tar.gz" \
-        --models resnet50 \
-        --outdir "${PROJECT_ROOT}/output/perf/resnet50" \
-        --iterations "${ITERATIONS}" \
-        --freq 999
-
-    info "Perf profiling completed. Results in: ${PROJECT_ROOT}/output/perf/resnet50"
-}
-
-# --- Direct lib mode (simpler setup) ---
-run_lib_mode() {
-    info "Running perf profiling with direct lib upload..."
-
-    if [ -z "${RVFUSE_HOST:-}" ]; then
-        error "RVFUSE_HOST environment variable not set."
-    fi
-
-    RVFUSE_PASSWORD="${RVFUSE_PASSWORD:-bianbu}"
-
-    python3 "${PROJECT_ROOT}/tools/perf_scalar_profile.py" \
-        --host "${RVFUSE_HOST}" \
-        --user root \
-        --password "${RVFUSE_PASSWORD}" \
-        --remote-dir "/root/resnet50-lib" \
-        --runner "${OUTPUT_DIR}/generic_ort_runner" \
-        --libs "${OUTPUT_DIR}/lib" \
-        --models resnet50 \
-        --outdir "${PROJECT_ROOT}/output/perf/resnet50-lib" \
-        --iterations "${ITERATIONS}" \
-        --freq 999
-
-    info "Lib mode profiling completed."
+    info "Perf profiling is now handled by the perf-profiling skill."
+    info "Ask Claude: '在香蕉派 ${RVFUSE_HOST:-<IP>} 上对 ResNet50 做 perf profiling，${ITERATIONS} 次迭代'"
+    info "The skill handles: upload → chroot → perf stat/record/report → download → summary"
 }
 
 # --- Main ---
@@ -126,8 +83,7 @@ check_prerequisites
 echo ""
 echo "Available test modes:"
 echo "  qemu     - Local QEMU simulation (default)"
-echo "  perf     - Banana Pi perf profiling (requires RVFUSE_HOST)"
-echo "  lib      - Direct lib upload mode (simpler)"
+echo "  perf     - Banana Pi perf profiling (via perf-profiling skill)"
 echo ""
 echo "Running mode: ${MODE}"
 echo "Iterations: ${ITERATIONS}"
@@ -136,7 +92,6 @@ echo ""
 case "${MODE}" in
     qemu)   run_qemu_test ;;
     perf)   run_perf_profile ;;
-    lib)    run_lib_mode ;;
     *)      error "Unknown mode: ${MODE}" ;;
 esac
 
